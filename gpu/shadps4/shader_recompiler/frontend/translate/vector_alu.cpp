@@ -570,9 +570,16 @@ void Translator::V_CNDMASK_B32(const GcnInst& inst) {
     } else {
         mask = GetSrc64(inst.src[2]);
     }
-    const IR::Value result = ir.Select(ir.InverseBallot(mask), GetSrc<IR::F32>(inst.src[1]),
-                                       GetSrc<IR::F32>(inst.src[0]));
-    SetDst(inst.dst[0], IR::U32F32{result});
+    // CNDMASK selects raw register bits. A float select can flush subnormal bit patterns
+    // (such as the fur shader's integer values 2 and 3) before they are reinterpreted.
+    const IR::U32 result{ir.Select(ir.InverseBallot(mask), GetSrc<IR::U32>(inst.src[1]),
+                                   GetSrc<IR::U32>(inst.src[0]))};
+    const auto& output_modifier = inst.dst[0].output_modifier;
+    if (output_modifier.multiplier != 0.f || output_modifier.clamp) {
+        SetDst(inst.dst[0], ir.BitCast<IR::F32>(result));
+    } else {
+        SetDst(inst.dst[0], result);
+    }
 }
 
 void Translator::V_ADD_F32(const GcnInst& inst) {

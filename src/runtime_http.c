@@ -303,7 +303,8 @@ int32_t runtime_http_add_request_header(int32_t req, const char *name, const cha
         strncpy(r->req_headers[r->req_header_count].name, name, sizeof(r->req_headers[0].name) - 1);
         strncpy(r->req_headers[r->req_header_count].value, value, sizeof(r->req_headers[0].value) - 1);
         r->req_header_count++;
-        runtime_net_trace("sceHttpAddRequestHeader(req=%d, '%s: %s')", req, name, value);
+        runtime_net_trace("sceHttpAddRequestHeader(req=%d, '%s', %zu bytes)", req, name,
+                          strlen(value));
     }
     return ORBIS_OK;
 }
@@ -451,7 +452,8 @@ int32_t runtime_http_send_request(int32_t req, const void *post_data, size_t siz
             r->resp_headers[r->resp_header_count].value[val_len] = '\0';
 
             if (_stricmp(r->resp_headers[r->resp_header_count].name, "X-Signature") == 0) {
-                runtime_net_trace("sceHttpSendRequest FOUND X-Signature: %s", r->resp_headers[r->resp_header_count].value);
+                runtime_net_trace("sceHttpSendRequest FOUND X-Signature (%zu bytes)",
+                                  strlen(r->resp_headers[r->resp_header_count].value));
             }
             r->resp_header_count++;
         }
@@ -605,15 +607,8 @@ int32_t runtime_http_parse_response_header(const char *blob, uint64_t blob_len, 
     }
     *value = blob + value_start;
     *length = final_len;
-    if (final_len < 128) {
-        char preview[128];
-        memcpy(preview, blob + value_start, (size_t)final_len);
-        preview[final_len] = '\0';
-        runtime_net_trace("sceHttpParseResponseHeader('%s') -> '%s'", name, preview);
-    } else {
-        runtime_net_trace("sceHttpParseResponseHeader('%s') -> %llu bytes", name,
-                          (unsigned long long)final_len);
-    }
+    runtime_net_trace("sceHttpParseResponseHeader('%s') -> %llu bytes", name,
+                      (unsigned long long)final_len);
     return (int32_t)line_end;
 }
 
