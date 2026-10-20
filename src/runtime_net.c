@@ -492,6 +492,53 @@ int32_t runtime_net_accept(int s, OrbisNetSockaddr *addr, uint32_t *addrlen) {
     return vfd;
 }
 
+/* The game opens its UDP 3074 on the router through UPnP (AddPortMapping, external port 3074 to
+ * this PC's 3074). On a network with several players every PC asked for the same external port,
+ * and the router gave it to the last one: the others stopped receiving their lobby's traffic
+ * (kicked out of the lobby) or received another PC's (karts under the track, teleports), as the
+ * logs of three PCs behind one router showed (2026-10-19). Each PC now asks for its own external
+ * port, from its address on the network (3075 + the last byte), still to its local 3074; the
+ * server sees that port and gives it to the peers. Same length as "3074": the request's
+ * Content-Length stays right. BB_UPNP_PORT=3074 keeps the game's own. */
+static int upnp_external_port(void) {
+    static int port;
+    if (port) return port;
+    const char *env = getenv("BB_UPNP_PORT");
+    if (env && atoi(env) >= 1024 && atoi(env) <= 9999) return port = atoi(env);
+    unsigned a = 0, b = 0, c = 0, d = 0;
+    port = sscanf(local_ipv4(), "%u.%u.%u.%u", &a, &b, &c, &d) == 4 && a != 127 ? 3075 + (int)(d & 255) : 3074;
+    return port;
+}
+
+/* A copy of a UPnP SOAP request with <NewExternalPort>3074< replaced, or NULL when there is none. */
+static char *upnp_rewrite(const void *msg, size_t len) {
+    static const char tag[] = "<NewExternalPort>3074<";
+    const char *data = (const char *)msg;
+    if (len < sizeof tag || len > 65536) return NULL;
+    int found = 0;
+    for (size_t at = 0; !found && at + sizeof tag - 1 <= len; ++at)
+        found = data[at] == '<' && memcmp(data + at, tag, sizeof tag - 1) == 0;
+    char *copy = found ? malloc(len) : NULL;
+    if (!copy) return NULL;
+    memcpy(copy, data, len);
+    char port[8];
+    snprintf(port, sizeof port, "%04d", upnp_external_port());
+    int changed = 0;
+    for (size_t at = 0; at + sizeof tag - 1 <= len; ++at) {
+        if (copy[at] == '<' && memcmp(copy + at, tag, sizeof tag - 1) == 0) {
+            memcpy(copy + at + strlen("<NewExternalPort>"), port, 4);
+            ++changed;
+        }
+    }
+    static int logged;
+    if (changed && !logged) {
+        logged = 1;
+        printf("[NET] UPnP: external port 3074 -> %s (one per PC on this network; BB_UPNP_PORT sets it)\n", port);
+        fflush(stdout);
+    }
+    return copy;
+}
+
 int32_t runtime_net_send(int s, const void *msg, size_t len, int flags) {
     VSocket *vs = vsocket_get(s);
     if (!vs) return ORBIS_NET_EBADF;
@@ -500,7 +547,9 @@ int32_t runtime_net_send(int s, const void *msg, size_t len, int flags) {
     if (flags & 0x1) win_flags |= MSG_OOB;
     if (flags & 0x4) win_flags |= MSG_DONTROUTE;
 
-    int ret = send(vs->s, (const char *)msg, (int)len, win_flags);
+    char *upnp = vs->is_stream && upnp_external_port() != 3074 ? upnp_rewrite(msg, len) : NULL;
+    int ret = send(vs->s, upnp ? upnp : (const char *)msg, (int)len, win_flags);
+    free(upnp);
     if (ret < 0) {
         int err = WSAGetLastError();
         if (err == WSAEWOULDBLOCK) {

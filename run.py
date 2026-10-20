@@ -218,6 +218,44 @@ def server_key(key, host):
     return hmac.new(bytes.fromhex(key), host.strip().lower().encode('utf-8'), hashlib.sha256).hexdigest()
 
 
+def key_hash(skey):
+    """What the server stores of a server key (nick_claims.go keyHash): the key of signatures."""
+    return hashlib.sha256(skey.strip().lower().encode('ascii')).hexdigest()
+
+
+def proof_header(khash, method, target):
+    """X-RyuNET-Proof for one request (the server's nick_proof.go): signed with the key's hash, so
+    the key never crosses the network, and good once, for a few minutes."""
+    ts, nonce = str(int(time.time())), secrets.token_hex(16)
+    mac = hmac.new(khash.encode('ascii'), f'{ts}\n{nonce}\n{method}\n{target}'.encode('utf-8'),
+                   hashlib.sha256).hexdigest()
+    return f'1.{ts}.{nonce}.{mac}'
+
+
+def claim_nick(host, port, name, khash):
+    """Registers this installation for a free nickname, before the game logs in with it (the
+    game's own requests are signed and cannot register). The key's hash crosses the network only
+    here, once. Nothing happens when the server cannot be reached or is older."""
+    import urllib.parse
+    import urllib.request
+    q = urllib.parse.urlencode({'name': name})
+    try:
+        target = f'/ryunet/nick?{q}'
+        req = urllib.request.Request(f'http://{host}:{port}{target}',
+                                     headers={'X-RyuNET-Proof': proof_header(khash, 'GET', target)})
+        with urllib.request.urlopen(req, timeout=4) as reply:
+            if json.loads(reply.read(4096)).get('status') != 'free':
+                return
+        target = f'/ryunet/nick/claim?{q}'
+        req = urllib.request.Request(f'http://{host}:{port}{target}', data=b'', method='POST',
+                                     headers={'X-RyuNET-Proof': proof_header(khash, 'POST', target),
+                                              'X-RyuNET-Key-Hash': khash})
+        with urllib.request.urlopen(req, timeout=4) as reply:
+            say(f'Nickname {name}: {json.loads(reply.read(4096)).get("status")} on {host}')
+    except (OSError, ValueError):
+        pass
+
+
 def season_theme(host, port):
     """The season theme the server announces (GET /ryunet/theme), or None when it does not answer.
     scripts/patches.py loads it in every level (THEME_VALUES)."""
@@ -268,8 +306,10 @@ def setup_online(env, config, data):
     env['BB_ONLINE_SERVER'] = host
     env['BB_ONLINE_NAME'] = name
     key = online_key(data)
+    env.pop('BB_ONLINE_KEY', None)  # the key is not sent any more: requests are signed with its hash
     if key:
-        env['BB_ONLINE_KEY'] = server_key(key, host)
+        env['BB_ONLINE_KEYHASH'] = key_hash(server_key(key, host))
+        claim_nick(host, auth_port, name, env['BB_ONLINE_KEYHASH'])
     # online_inventory=save: keep the Pit Stop items of this save (a "100%" save) online
     # instead of the ones bought on the server, which are tied to the nickname.
     if env.get('BB_ONLINE_INVENTORY', ini_values.get('online_inventory', 'server')).strip().lower() == 'save':

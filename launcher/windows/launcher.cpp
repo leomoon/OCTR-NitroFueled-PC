@@ -916,42 +916,72 @@ void SplitServer(const std::string& server, std::string& host, INTERNET_PORT& po
 
 /// What one server sees of the installation's key: HMAC-SHA256(key, host), as run.py sends it.
 /// Every server gets a different value, so none can reuse it on another to take a nickname.
-std::string ServerKey(const std::string& host) {
-    const std::string key = OnlineKey();
-    if (key.size() != 64) return {};
-    unsigned char raw[32];
-    for (int i = 0; i < 32; ++i) raw[i] = static_cast<unsigned char>(std::stoi(key.substr(i * 2, 2), nullptr, 16));
-    const std::string msg = Lower(Trim(host));
-    unsigned char mac[32];
+/// SHA-256 of msg (HMAC-SHA256 with key when there is one), in lower-case hex; "" on failure.
+std::string Sha256Hex(const std::string& msg, const std::string& key = {}) {
+    unsigned char out[32];
     bool ok = false;
     BCRYPT_ALG_HANDLE alg = nullptr;
-    if (BCryptOpenAlgorithmProvider(&alg, BCRYPT_SHA256_ALGORITHM, nullptr, BCRYPT_ALG_HANDLE_HMAC_FLAG) == 0) {
+    if (BCryptOpenAlgorithmProvider(&alg, BCRYPT_SHA256_ALGORITHM, nullptr,
+                                    key.empty() ? 0 : BCRYPT_ALG_HANDLE_HMAC_FLAG) == 0) {
         BCRYPT_HASH_HANDLE hash = nullptr;
-        if (BCryptCreateHash(alg, &hash, nullptr, 0, raw, sizeof raw, 0) == 0) {
+        if (BCryptCreateHash(alg, &hash, nullptr, 0, reinterpret_cast<PUCHAR>(const_cast<char*>(key.data())),
+                             ULONG(key.size()), 0) == 0) {
             ok = BCryptHashData(hash, reinterpret_cast<PUCHAR>(const_cast<char*>(msg.data())), ULONG(msg.size()), 0) == 0 &&
-                 BCryptFinishHash(hash, mac, sizeof mac, 0) == 0;
+                 BCryptFinishHash(hash, out, sizeof out, 0) == 0;
             BCryptDestroyHash(hash);
         }
         BCryptCloseAlgorithmProvider(alg, 0);
     }
     if (!ok) return {};
     static const char kHex[] = "0123456789abcdef";
-    std::string out;
-    for (const unsigned char b : mac) {
-        out += kHex[b >> 4];
-        out += kHex[b & 15];
+    std::string hex;
+    for (const unsigned char b : out) {
+        hex += kHex[b >> 4];
+        hex += kHex[b & 15];
     }
-    return out;
+    return hex;
 }
 
-/// A request to the RyuNET server's HTTP port, with this installation's key for that server.
+std::string ServerKey(const std::string& host) {
+    const std::string key = OnlineKey();
+    if (key.size() != 64) return {};
+    std::string raw(32, '\0');
+    for (int i = 0; i < 32; ++i) raw[size_t(i)] = static_cast<char>(std::stoi(key.substr(i * 2, 2), nullptr, 16));
+    return Sha256Hex(Lower(Trim(host)), raw);
+}
+
+/// What the server stores of the server key (its keyHash): the key requests are signed with.
+std::string ServerKeyHash(const std::string& host) {
+    const std::string key = ServerKey(host);
+    return key.empty() ? std::string() : Sha256Hex(key);
+}
+
+/// X-RyuNET-Proof for one request (the server's nick_proof.go, run.py proof_header): the key
+/// never crosses the network, and the signature is good once, for a few minutes.
+std::string ProofHeader(const std::string& key_hash, const char* method, const std::string& target) {
+    unsigned char raw[16];
+    if (key_hash.empty() || BCryptGenRandom(nullptr, raw, sizeof raw, BCRYPT_USE_SYSTEM_PREFERRED_RNG) != 0) return {};
+    static const char kHex[] = "0123456789abcdef";
+    std::string nonce;
+    for (const unsigned char b : raw) {
+        nonce += kHex[b >> 4];
+        nonce += kHex[b & 15];
+    }
+    const std::string ts = std::to_string(static_cast<long long>(std::time(nullptr)));
+    const std::string mac = Sha256Hex(ts + "\n" + nonce + "\n" + method + "\n" + target, key_hash);
+    return mac.empty() ? std::string() : "1." + ts + "." + nonce + "." + mac;
+}
+
+/// A request to the RyuNET server's HTTP port, signed with this installation's key for that
+/// server; register also sends the key's hash (a Discord link takes it for a new installation).
 /// The body, or "" when the server could not be reached. Called from background threads.
 std::string HttpRequest(const std::string& server, const wchar_t* method, const std::wstring& path,
-                        const std::string& form = {}, int timeout_ms = 3000) {
+                        const std::string& form = {}, int timeout_ms = 3000, bool register_key = false) {
     std::string host;
     INTERNET_PORT port = 0;
     SplitServer(server, host, port);
-    const std::string key = ServerKey(host);
+    const std::string key_hash = ServerKeyHash(host);
+    const std::string proof = ProofHeader(key_hash, Narrow(method).c_str(), Narrow(path));
     std::string body;
     HINTERNET session = WinHttpOpen(L"CTR-NitroFueled-PC launcher", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
                                     WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
@@ -962,7 +992,8 @@ std::string HttpRequest(const std::string& server, const wchar_t* method, const 
                                               WINHTTP_DEFAULT_ACCEPT_TYPES, 0)
                          : nullptr;
     std::wstring headers;
-    if (!key.empty()) headers += L"X-RyuNET-Key: " + Widen(key) + L"\r\n";
+    if (!proof.empty()) headers += L"X-RyuNET-Proof: " + Widen(proof) + L"\r\n";
+    if (register_key && !key_hash.empty()) headers += L"X-RyuNET-Key-Hash: " + Widen(key_hash) + L"\r\n";
     if (!form.empty()) headers += L"Content-Type: application/x-www-form-urlencoded\r\n";
     if (req && WinHttpSendRequest(req, headers.empty() ? WINHTTP_NO_ADDITIONAL_HEADERS : headers.c_str(),
                                   headers.empty() ? 0 : DWORD(-1),
@@ -2956,7 +2987,8 @@ void StartDiscordLink(DiscordLinkMode mode) {
             } else {
                 const std::string body =
                     HttpRequest(server, L"POST", L"/ryunet/discord/link",
-                                form("nick", nick) + "&" + form("code", auth.code) + "&" + form("redirect_uri", auth.redirect_uri), 25000);
+                                form("nick", nick) + "&" + form("code", auth.code) + "&" + form("redirect_uri", auth.redirect_uri), 25000,
+                                true);
                 const std::string status = JsonField(body, "status"), account = JsonField(body, "discord");
                 if (status == "linked") {
                     error = false;

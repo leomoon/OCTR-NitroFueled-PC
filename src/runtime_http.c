@@ -1,9 +1,11 @@
 #include "runtime_http.h"
 #include "runtime_net.h"
 #include "runtime_net_overrides.h"
+#include "bb_sha256.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #ifdef _WIN32
 #include <winsock2.h>
@@ -367,13 +369,31 @@ int32_t runtime_http_send_request(int32_t req, const void *post_data, size_t siz
         hlen += snprintf(header_buf + hlen, sizeof(header_buf) - hlen,
                          "%s: %s\r\n", r->req_headers[i].name, r->req_headers[i].value);
     }
-    /* RyuNET nickname ownership: the server lets this installation's secret (BB_ONLINE_KEY,
-     * written by the launcher or run.py) keep the nickname it first used. Sent only to hosts
+    /* RyuNET nickname ownership: the server lets this installation keep the nickname it first
+     * used. The request is signed (X-RyuNET-Proof, the server's nick_proof.go) with the hash of
+     * the installation's key for this server (BB_ONLINE_KEYHASH, from run.py): the key itself
+     * never crosses the network, and a copied signature is refused. Sent only to hosts
      * redirected to the RyuNET server, never to a real one. */
-    const char *key = c->is_plain_http ? getenv("BB_ONLINE_KEY") : NULL;
-    if (key && strlen(key) == 64 && strspn(key, "0123456789abcdefABCDEF") == 64 &&
-        hlen < (int)sizeof(header_buf) - 96) {
-        hlen += snprintf(header_buf + hlen, sizeof(header_buf) - hlen, "X-RyuNET-Key: %s\r\n", key);
+    const char *key_hash = c->is_plain_http ? getenv("BB_ONLINE_KEYHASH") : NULL;
+    if (key_hash && strlen(key_hash) == 64 && strspn(key_hash, "0123456789abcdef") == 64 &&
+        hlen < (int)sizeof(header_buf) - 200) {
+        static unsigned long long counter;
+        struct timespec now;
+        timespec_get(&now, TIME_UTC);
+        char nonce[33], message[1200];
+        snprintf(nonce, sizeof nonce, "%016llx%016llx",
+                 (unsigned long long)now.tv_sec * 1000000000ull + (unsigned long long)now.tv_nsec,
+                 __atomic_add_fetch(&counter, 1, __ATOMIC_RELAXED) ^ (unsigned long long)(uintptr_t)&now);
+        const int n = snprintf(message, sizeof message, "%lld\n%s\n%s\n%s", (long long)now.tv_sec, nonce,
+                               method_str, r->path);
+        if (n > 0 && n < (int)sizeof message) {
+            uint8_t mac[32];
+            bb_hmac_sha256((const unsigned char *)key_hash, 64, (const unsigned char *)message, (size_t)n, mac);
+            char mac_hex[65];
+            for (int i = 0; i < 32; i++) snprintf(mac_hex + 2 * i, 3, "%02x", mac[i]);
+            hlen += snprintf(header_buf + hlen, sizeof(header_buf) - hlen, "X-RyuNET-Proof: 1.%lld.%s.%s\r\n",
+                             (long long)now.tv_sec, nonce, mac_hex);
+        }
     }
     /* The player chose to keep their save's Pit Stop items (BB_ONLINE_INVENTORY=save, from the
      * launcher's Online tab): the server then leaves the game its save's inventory. */
