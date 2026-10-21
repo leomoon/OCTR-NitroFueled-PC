@@ -644,20 +644,27 @@ static void fault(int sig, siginfo_t *info, void *context) {
     else
         snprintf(line, sizeof(line), "Fault (signal %d) at RIP %p, address %p\n", sig, (void *)rip, info->si_addr);
     { ssize_t written_=write(2, line, strlen(line)); (void)written_; }
-    if (!rip) {
-        /* An indirect call to zero leaves its return address at RSP. A jump or return to zero
-         * may leave something else there, so report this as a candidate call site. */
-        uintptr_t rsp=(uintptr_t)uc->uc_mcontext.gregs[REG_RSP], caller=0;
-        if (rsp && read_self_memory(&caller,rsp,sizeof(caller))==(ssize_t)sizeof(caller)) {
+    /* RIP in no mapping at all (zero, or a pointer like 0xffffffff): nothing there to name, and
+     * the unwinder cannot start from it. An indirect call leaves its return address at RSP; a
+     * jump or return may leave something else, so the first stack slots that point into code
+     * are reported as candidate call sites. */
+    const int nowhere = !rip || (site < 0 && rip - (uintptr_t)image >= 0x10000000 &&
+                                 !(dladdr((void *)rip, &where) && where.dli_fname));
+    if (nowhere) {
+        uintptr_t rsp=(uintptr_t)uc->uc_mcontext.gregs[REG_RSP];
+        int reported=0;
+        for (int slot=0; rsp && slot<64 && reported<6; ++slot) {
+            uintptr_t caller=0;
+            if (read_self_memory(&caller,rsp+(uintptr_t)slot*8,sizeof(caller))!=(ssize_t)sizeof(caller)) break;
             if (caller-(uintptr_t)image<0x10000000)
-                snprintf(line,sizeof(line),"  stack return candidate: guest offset 0x%lx\n",
+                snprintf(line,sizeof(line),"  stack [rsp+0x%x] return candidate: guest offset 0x%lx\n",slot*8,
                          (unsigned long)(caller-(uintptr_t)image));
-            else if (dladdr((void *)caller,&where) && where.dli_fname)
-                snprintf(line,sizeof(line),"  stack return candidate: %s+0x%lx (%s)\n",where.dli_fname,
+            else if (caller>0x10000 && dladdr((void *)caller,&where) && where.dli_fname)
+                snprintf(line,sizeof(line),"  stack [rsp+0x%x] return candidate: %s+0x%lx (%s)\n",slot*8,where.dli_fname,
                          (unsigned long)(caller-(uintptr_t)where.dli_fbase),where.dli_sname ? where.dli_sname : "?");
-            else
-                snprintf(line,sizeof(line),"  stack return candidate: %p\n",(void *)caller);
+            else continue;
             { ssize_t written_=write(2,line,strlen(line)); (void)written_; }
+            ++reported;
         }
         snprintf(line,sizeof(line),"  rsp=%p rbp=%p rax=%p rbx=%p rcx=%p rdx=%p\n",
                  (void *)rsp,(void *)(uintptr_t)uc->uc_mcontext.gregs[REG_RBP],
@@ -693,9 +700,10 @@ static void fault(int sig, siginfo_t *info, void *context) {
             { ssize_t written_=write(2,line,strlen(line)); (void)written_; }
         }
     }
-    /* Host call chain (frames with unwind info; guest frames end it). */
+    /* Host call chain (frames with unwind info; guest frames end it). Not from a RIP in no
+     * mapping: the stack candidates above stand for it. */
     void *frames[32];
-    int depth = backtrace(frames, 32);
+    int depth = nowhere ? 0 : backtrace(frames, 32);
     for (int i = 2; i < depth; ++i) {
         if (dladdr(frames[i], &where) && where.dli_fname)
             snprintf(line, sizeof(line), "  #%d %s+0x%lx (%s)\n", i, where.dli_fname,

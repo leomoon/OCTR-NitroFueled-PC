@@ -64,6 +64,14 @@ void Set(Values& v, const std::string& key, const std::string& value) {
         v.debug_view = std::clamp(i, 0, DebugViewCount - 1);
     } else if (key == "show_fps") {
         v.show_fps = i != 0;
+    } else if (key == "friends_hide_activity") {
+        v.friends_hide_activity = i != 0;
+    } else if (key == "friends_hide_me") {
+        v.friends_hide_me = i != 0;
+    } else if (key == "friends_no_notices") {
+        v.friends_no_notices = i != 0;
+    } else if (key == "notice_position") {
+        v.notice_position = std::clamp(i, 0, int(NoticeCount) - 1);
     } else if (key == "fps_limit") {
         v.fps_limit = std::clamp(i, 0, 1000);
     } else if (key == "async_pipelines") {
@@ -371,6 +379,10 @@ void Save() {
     put("reactive_max", fixed(v.reactive_max, 2));
     put("debug_view", std::to_string(v.debug_view.load()));
     put("show_fps", flag(v.show_fps));
+    put("friends_hide_activity", flag(v.friends_hide_activity));
+    put("friends_hide_me", flag(v.friends_hide_me));
+    put("friends_no_notices", flag(v.friends_no_notices));
+    put("notice_position", std::to_string(v.notice_position.load()));
     put("fps_limit", std::to_string(v.fps_limit.load()));
     put("async_pipelines", flag(v.async_pipelines));
     put("msaa", flag(v.msaa));

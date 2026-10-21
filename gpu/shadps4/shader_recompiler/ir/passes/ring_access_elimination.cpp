@@ -68,7 +68,17 @@ void RingAccessElimination(const IR::Program& program, const RuntimeInfo& runtim
                 }
 
                 const auto offset = inst.Flags<IR::BufferInstInfo>().inst_offset.Value();
-                ASSERT(offset < runtime_info.hw.es.vertex_data_size * 4);
+                if (offset >= runtime_info.hw.es.vertex_data_size * 4) {
+                    // bbport: a store past the vertex data the geometry stage reads (one
+                    // racer's outfit online ended the game with code 23 here). Nothing reads
+                    // it, so it is dropped instead of stopping the game.
+                    LOG_WARNING(Render_Vulkan,
+                                "RingAccessElimination: export store at byte {} is past the "
+                                "vertex data ({} dwords); dropped",
+                                offset, runtime_info.hw.es.vertex_data_size);
+                    inst.Invalidate();
+                    break;
+                }
                 const auto data = ir.BitCast<IR::F32>(IR::U32{inst.Arg(2)});
                 const auto attrib =
                     IR::Value{offset < 16 ? IR::Attribute::Position0

@@ -16,6 +16,7 @@ import hmac
 import json
 import os
 from pathlib import Path
+import re
 import secrets
 import shutil
 import subprocess
@@ -32,6 +33,7 @@ PORT = Path(__file__).resolve().parent
 TITLE_ID = 'CUSA13795'
 APP_VERSION = '01.21'
 RESTART_CODE = 75  # the game asks to be started again (in-game "Apply and restart")
+UNSUPPORTED_GPU_CODE = 24  # no Vulkan 1.3: GPU, driver or loader (gpu/.../vk_platform.h)
 
 sys.path.insert(0, str(PORT / 'scripts'))
 import archive_patch  # noqa: E402  (scripts/)
@@ -256,16 +258,58 @@ def claim_nick(host, port, name, khash):
         pass
 
 
-def season_theme(host, port):
-    """The season theme the server announces (GET /ryunet/theme), or None when it does not answer.
-    scripts/patches.py loads it in every level (THEME_VALUES)."""
+def server_settings(host, port):
+    """What the server announces for every player (GET /ryunet/theme): the season theme, which
+    scripts/patches.py loads in every level (THEME_VALUES), and the seconds an online race goes on
+    after the first player finishes (end_race_patches). {} when it does not answer."""
     import urllib.request
     try:
         with urllib.request.urlopen(f'http://{host}:{port}/ryunet/theme', timeout=3) as reply:
-            theme = json.loads(reply.read(4096)).get('theme')
-    except (OSError, ValueError, AttributeError):
+            reply = json.loads(reply.read(4096))
+    except (OSError, ValueError):
+        return {}
+    return reply if isinstance(reply, dict) else {}
+
+
+RELEASES_API = 'https://api.github.com/repos/Ryu7w7/OCTR-NitroFueled-PC/releases/latest'
+
+
+def parse_version(text):
+    """(major, minor, patch, stage) as the launchers compare versions (launcher/appimage_update.py,
+    launcher/windows/port_update.cpp): stage 0 a pre-release, 1 the release, 2 commits after it."""
+    m = re.match(r'^\s*[vV]?(\d{1,5})\.(\d{1,5})(?:\.(\d{1,5}))?(.*?)\s*$', text or '')
+    if not m:
         return None
-    return theme if theme in ('default', 'halloween', 'golden') else None
+    suffix = m.group(4)
+    while True:
+        for drop in ('-dirty', '-windows', '-linux'):
+            if suffix.endswith(drop):
+                suffix = suffix[:-len(drop)]
+                break
+        else:
+            break
+    stage = 1 if not suffix else 2 if re.fullmatch(r'-\d+-g[0-9a-fA-F]+', suffix) else 0
+    return int(m.group(1)), int(m.group(2)), int(m.group(3) or 0), stage
+
+
+def update_notice(env, version):
+    """A release newer than this one: BB_UPDATE_AVAILABLE=<tag>, which the game shows as a notice
+    (gpu/shim/bbport_overlay.cpp). Off with BB_UPDATE_CHECK=0; nothing when GitHub does not answer."""
+    have = parse_version(version)
+    if env.get('BB_UPDATE_CHECK') == '0' or not have:
+        return
+    import urllib.request
+    try:
+        request = urllib.request.Request(RELEASES_API, headers={'Accept': 'application/vnd.github+json',
+                                                                'User-Agent': 'SacredFire-run.py'})
+        with urllib.request.urlopen(request, timeout=3) as reply:
+            tag = json.loads(reply.read(1 << 20)).get('tag_name', '')
+    except (OSError, ValueError, AttributeError):
+        return
+    latest = parse_version(tag)
+    if latest and latest > have:
+        env['BB_UPDATE_AVAILABLE'] = tag
+        say(f'A newer release is available: {tag} (update from the launcher)')
 
 
 def setup_online(env, config, data):
@@ -304,6 +348,7 @@ def setup_online(env, config, data):
             auth_port = p
 
     env['BB_ONLINE_SERVER'] = host
+    env['BB_ONLINE_HTTP_PORT'] = auth_port  # the runtime's own requests (Friends tab)
     env['BB_ONLINE_NAME'] = name
     key = online_key(data)
     env.pop('BB_ONLINE_KEY', None)  # the key is not sent any more: requests are signed with its hash
@@ -356,13 +401,18 @@ def setup_online(env, config, data):
     }
     overrides_file.write_text(json.dumps(overrides, indent=2) + '\n', encoding='utf-8')
     say(f'RyuNET Online active -> server {host}:{auth_port}, user {name}')
-    # Every player loads the theme the server announces (bbport.ini theme= only applies offline).
-    if not env.get('BB_THEME'):
-        theme = season_theme(host, auth_port)
-        if theme:
-            env['BB_THEME'] = theme
-            if theme != 'default':
-                say(f'Season theme from the server: {theme}')
+    # Every player loads the theme the server announces (bbport.ini theme= only applies offline),
+    # and the server's race-end countdown.
+    announced = server_settings(host, auth_port)
+    theme = announced.get('theme')
+    if not env.get('BB_THEME') and theme in ('default', 'halloween', 'golden'):
+        env['BB_THEME'] = theme
+        if theme != 'default':
+            say(f'Season theme from the server: {theme}')
+    end_race = announced.get('end_race_timeout')
+    if not env.get('BB_END_RACE_TIMEOUT') and isinstance(end_race, (int, float)) and 10 <= end_race <= 120:
+        env['BB_END_RACE_TIMEOUT'] = str(end_race)
+        say(f'Online race end countdown from the server: {end_race} s')
 
 
 def pump(stream):
@@ -564,6 +614,7 @@ def main():
                 version = candidate.read_text().strip()
                 break
         say(f'SacredFire {version or "unknown version"}')
+        update_notice(env, version)
         # The GPU library builds its path table when it loads: the user directory must exist.
         user_dir.mkdir(parents=True, exist_ok=True)
         env['BB_GPU_USER_DIR'] = str(user_dir)
@@ -616,6 +667,10 @@ def main():
             reader.join(timeout=5)
             if code != RESTART_CODE:
                 say(f'--- the game ended with code {code}')
+                if code == UNSUPPORTED_GPU_CODE:
+                    say('--- This GPU or its driver does not support Vulkan 1.3, which the game needs. '
+                        'Update the graphics driver; if it is already the latest, the GPU is too old for '
+                        'Windows (on Linux, the Mesa driver supports Vulkan 1.3 on many older GPUs).')
                 return code
             say(f'--- SacredFire launch {time.strftime("%Y-%m-%d %H:%M:%S")} (restart from the menu)')
     finally:

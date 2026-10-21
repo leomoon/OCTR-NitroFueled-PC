@@ -38,6 +38,7 @@ GAME_PATCH_KEYS={'patch_60fps':'CrashTeamRacing.xml/60 FPS Unlock',
                  'patch_online_key':'CrashTeamRacingOnline.xml/Online: custom Demonware key'}
 # The bundled files of other editions: their patches are selected under the USA files' keys.
 BUNDLED_FILES={'CrashTeamRacingEU.xml':'CrashTeamRacing.xml',
+               'CrashTeamRacingUnlockAllEU.xml':'CrashTeamRacingUnlockAll.xml',
                'CrashTeamRacingOnlineEU.xml':'CrashTeamRacingOnline.xml'}
 
 
@@ -173,6 +174,29 @@ def theme_patches(settings):
                   Value=f'4c89efbe{value:02x}0000000f1f440000',Signature=THEME_SIGNATURE,
                   SignatureOffset='0x0')
     return [(f'theme/{theme}',None,meta)]
+
+
+# Online race end: once the first player finishes, the others have CNetworkConfig._endRaceTimeout
+# seconds ("ends in" countdown). The official NetConfig set it; without one the game keeps the
+# default its type registration gives: 20.0, in the field's setDefault (eboot.elf 0x196b610,
+# loaded at 0x1d6b610: mov dword [rbp-34h],<float>). BB_END_RACE_TIMEOUT (run.py: what the
+# RyuNET server announces) replaces that float.
+END_RACE_SIGNATURE='4b 8b bc fe 60 02 00 00 c7 45 cc 00 00 a0 41'
+
+
+def end_race_patches():
+    """The built-in patch element for the online race-end countdown (none for the default 20 s)."""
+    try:
+        seconds=float(os.environ.get('BB_END_RACE_TIMEOUT') or 20)
+    except ValueError:
+        return []
+    if seconds==20 or not 10<=seconds<=120:
+        return []
+    value=struct.pack('<f',seconds).hex()
+    meta=ET.Element('Metadata',Name=f'Online race end {seconds:g} s',AppVer=APP_VERSION,AppElf='eboot.bin')
+    ET.SubElement(ET.SubElement(meta,'PatchList'),'Line',Type='bytes',Address='0x01d6b610',
+                  Value='4b8bbcfe60020000c745cc'+value,Signature=END_RACE_SIGNATURE,SignatureOffset='0x0')
+    return [(f'end_race/{seconds:g}',None,meta)]
 
 
 def read_settings(path):
@@ -506,7 +530,7 @@ def main():
     found=all_external_patches(a.patches_dir or [root/'patches'],a.app_version,a.title_id)
     settings=read_settings(a.settings)
     writes=compile_external(external_selection(found,a.patches_config,settings)+render_patches(settings)
-                            +theme_patches(settings),
+                            +theme_patches(settings)+end_race_patches(),
                             segments,elf)
     write_blob(a.out,writes)
     print(f'Patches: {len(writes)} writes from {len(found)} available patches')

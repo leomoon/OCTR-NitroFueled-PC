@@ -198,6 +198,22 @@ static void poll_invite_file(void) {
     printf("Runtime: invitation from %s accepted in Discord: joining session %s\n",host,session);
 }
 
+/* An invitation accepted in the menu's Friends tab (runtime_friends.c): offered to the game
+ * like one accepted in Discord. */
+void runtime_invite_join(const char *host) {
+    if (!invite_text_ok(host,16)) return;
+    const time_t now=time(NULL);
+    pthread_mutex_lock(&s_invite_lock);
+    snprintf(s_invite.session,sizeof s_invite.session,"cusa13795-session-%s",host);
+    snprintf(s_invite.host,sizeof s_invite.host,"%s",host);
+    s_invite.expires=now+240;
+    s_invite.next_offer=now;
+    s_invite.active=1;
+    s_invite.taken=0;
+    pthread_mutex_unlock(&s_invite_lock);
+    printf("Runtime: invitation from %s accepted in the Friends tab: joining their session\n",host);
+}
+
 static int invite_due(void) {
     poll_invite_file();
     const time_t now=time(NULL);
@@ -265,6 +281,7 @@ static ABI int32_t launch_browser(void) { note("SystemService: web browser reque
 #include "runtime_net.h"
 #include "runtime_http.h"
 #include "runtime_np_online.h"
+#include "runtime_friends.h"
 
 /* ---- NetCtl / Net / Http / Ssl ---- */
 static ABI int32_t net_init(void) { return runtime_net_init(); }
@@ -324,6 +341,24 @@ static ABI int32_t netctl_check(void) { return runtime_netctl_check(); }
 
 static ABI int32_t lib_init_id(void) { return new_id(); }
 static ABI int32_t ok_void(void) { return 0; }
+
+/* NpWebApi push events: none are sent. Logged (each filter's first data type, the string its
+ * parameters start with). NpToolkit2 listens only for presence ("np:service:presence:onlineStatus"
+ * and, for "inGamePresence", "np:service:presence:gameTitleInfo"), not for friend list changes:
+ * the game reads its friend list once, at sign-in. */
+static ABI int32_t np_push_filter(int32_t lib, int32_t handle, const char *service, uint32_t label,
+                                  const char *params, size_t count) {
+    const int32_t id=new_id();
+    printf("Runtime: NpWebApi push filter %d (lib %d, handle %d, service '%s', label %u, %zu type(s))\n",id,lib,handle,
+           service ? service : "",label,count);
+    if (params && count) printf("  first type '%.64s'\n",params);
+    return id;
+}
+static ABI int32_t np_push_callback(int32_t user, int32_t filter, void *callback, void *arg) {
+    const int32_t id=new_id();
+    printf("Runtime: NpWebApi push callback %d (user ctx %d, filter %d, function %p, arg %p)\n",id,user,filter,callback,arg);
+    return id;
+}
 
 /* HTTP */
 static ABI int32_t http_init_abi(void) { return runtime_http_init(); }
@@ -1454,7 +1489,20 @@ static int32_t dialog_term(int i) {
     static ABI int32_t tag##_open(const void *p) { (void)p; return dialog_open(i); } \
     static ABI int32_t tag##_status(void) { return dialog_status(i); } \
     static ABI int32_t tag##_term(void) { return dialog_term(i); }
-DIALOG(msg,1) DIALOG(save,2) DIALOG(profile,3) DIALOG(commerce,4) DIALOG(webbrowser,6) DIALOG(invitation,7) DIALOG(signin,8) DIALOG(customdata,9)
+DIALOG(msg,1) DIALOG(save,2) DIALOG(profile,3) DIALOG(commerce,4) DIALOG(webbrowser,6) DIALOG(signin,8) DIALOG(customdata,9)
+/* The game's Invite button opens the PS4 invitation dialog to pick friends (its parameter names
+ * only the game's own session, "cusa13795-session-<nickname>", in user-select mode). With RyuNET
+ * friends, every friend online is invited at once and a notice says so (runtime_friends.c); the
+ * dialog then closes as before. */
+static ABI int32_t invitation_init(void) { return dialog_init(7); }
+static ABI int32_t invitation_open(const void *p) {
+    (void)p;
+    if (!dialogs[7].initialized) return DIALOG_NOT_INITIALIZED;
+    if (runtime_friends_invite_online()) printf("Runtime: InvitationDialog: friends online invited\n");
+    return dialog_open(7);
+}
+static ABI int32_t invitation_status(void) { return dialog_status(7); }
+static ABI int32_t invitation_term(void) { return dialog_term(7); }
 /* SacredFire: the web browser and invitation dialogs close at once with a zeroed result (user
  * closed / no invitation sent); Close on the browser is accepted. */
 static ABI int32_t webbrowser_close(void) { if (!dialogs[6].initialized) return DIALOG_NOT_INITIALIZED; dialogs[6].status=3; return 0; }
@@ -1964,9 +2012,9 @@ static const RuntimeExport exports[]={
     {"sceNpWebApiCreateContext",np_webapi_create_ctx}, {"sceNpWebApiCreateContextA",np_webapi_create_ctx_a},
     {"sceNpWebApiCreateHandle",lib_init_id}, {"sceNpWebApiDeleteHandle",ok_void},
     {"sceNpWebApiCreatePushEventFilter",lib_init_id}, {"sceNpWebApiDeletePushEventFilter",ok_void},
-    {"sceNpWebApiCreateExtdPushEventFilter",lib_init_id}, {"sceNpWebApiDeleteExtdPushEventFilter",ok_void},
+    {"sceNpWebApiCreateExtdPushEventFilter",np_push_filter}, {"sceNpWebApiDeleteExtdPushEventFilter",ok_void},
     {"sceNpWebApiRegisterPushEventCallback",lib_init_id}, {"sceNpWebApiUnregisterPushEventCallback",ok_void},
-    {"sceNpWebApiRegisterExtdPushEventCallback",lib_init_id}, {"sceNpWebApiRegisterExtdPushEventCallbackA",lib_init_id},
+    {"sceNpWebApiRegisterExtdPushEventCallback",lib_init_id}, {"sceNpWebApiRegisterExtdPushEventCallbackA",np_push_callback},
     {"sceNpWebApiUnregisterExtdPushEventCallback",ok_void},
     {"sceNpWebApiCreateRequest",np_webapi_create_req}, {"sceNpWebApiSendRequest",np_webapi_send_req},
     {"sceNpWebApiSendRequest2",np_webapi_send_req2}, {"sceNpWebApiAddHttpRequestHeader",np_webapi_add_header},

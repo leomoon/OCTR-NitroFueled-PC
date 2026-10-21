@@ -139,6 +139,8 @@ std::string FormatBytes(std::uintmax_t bytes) {
 
 const ImVec4 kGreen{0.45f, 0.85f, 0.45f, 1.0f};
 const ImVec4 kRed{1.0f, 0.45f, 0.40f, 1.0f};
+// The game found no Vulkan 1.3 (GPU, driver or loader): UnsupportedVulkanExitCode in vk_platform.h.
+constexpr DWORD kUnsupportedGpuCode = 24;
 const ImVec4 kYellow{1.0f, 0.80f, 0.35f, 1.0f};
 const ImVec4 kGrey{0.65f, 0.65f, 0.68f, 1.0f};
 // The Achievements page (TrophiesTab, from GetLostIn's launcher v0.4, GPL-2.0) draws with its
@@ -682,7 +684,6 @@ struct App {
     Ini game;      // bbport.ini
     char online_server_buf[128] = "octr.ryu7w7.xyz";
     char online_name_buf[32] = "";
-    char online_friends_buf[512] = "";
 
     // Game folders.
     fs::path game_dir, base_dir, update_dir;
@@ -776,13 +777,10 @@ void SyncOnlineBuffers() {
         a.game.Set("online_server", srv);
     }
     std::string nick = a.game.Get("online_name", a.game.Get("user_name"));
-    std::string friends = a.game.Get("online_friends", "");
     std::strncpy(a.online_server_buf, srv.c_str(), sizeof(a.online_server_buf) - 1);
     a.online_server_buf[sizeof(a.online_server_buf) - 1] = '\0';
     std::strncpy(a.online_name_buf, nick.c_str(), sizeof(a.online_name_buf) - 1);
     a.online_name_buf[sizeof(a.online_name_buf) - 1] = '\0';
-    std::strncpy(a.online_friends_buf, friends.c_str(), sizeof(a.online_friends_buf) - 1);
-    a.online_friends_buf[sizeof(a.online_friends_buf) - 1] = '\0';
 }
 
 std::string CurrentNick() { return Trim(g_app.game.Get("online_name", g_app.game.Get("user_name"))); }
@@ -890,6 +888,9 @@ struct NickCheck {
         bool linked = false;          // the nickname is linked to a Discord account
         bool link_available = false;  // the server can link Discord accounts
         std::string discord;          // the linked account's name (only for our own nickname)
+        std::string banned;           // the ban's reason when this player or address is banned
+        std::string ban_kind;         // "player" or "ip"
+        long long ban_until = 0;      // unix time; 0: permanent
     };
     std::mutex mutex;
     std::map<std::string, Result> results;  // "server|nick" -> answer
@@ -924,8 +925,10 @@ std::string Sha256Hex(const std::string& msg, const std::string& key = {}) {
     if (BCryptOpenAlgorithmProvider(&alg, BCRYPT_SHA256_ALGORITHM, nullptr,
                                     key.empty() ? 0 : BCRYPT_ALG_HANDLE_HMAC_FLAG) == 0) {
         BCRYPT_HASH_HANDLE hash = nullptr;
-        if (BCryptCreateHash(alg, &hash, nullptr, 0, reinterpret_cast<PUCHAR>(const_cast<char*>(key.data())),
-                             ULONG(key.size()), 0) == 0) {
+        // No secret at all for a plain hash: a non-null pointer, even with length 0, makes
+        // BCryptCreateHash fail (STATUS_INVALID_PARAMETER), and every request went unsigned.
+        PUCHAR secret = key.empty() ? nullptr : reinterpret_cast<PUCHAR>(const_cast<char*>(key.data()));
+        if (BCryptCreateHash(alg, &hash, nullptr, 0, secret, ULONG(key.size()), 0) == 0) {
             ok = BCryptHashData(hash, reinterpret_cast<PUCHAR>(const_cast<char*>(msg.data())), ULONG(msg.size()), 0) == 0 &&
                  BCryptFinishHash(hash, out, sizeof out, 0) == 0;
             BCryptDestroyHash(hash);
@@ -1037,6 +1040,9 @@ bool JsonNumber(const std::string& body, const char* key, int& value) {
     return true;
 }
 
+// Defined with the Discord join secrets below.
+std::string JsonText(const std::string& body, const char* key);
+
 /// A true/false field of a small flat JSON answer.
 bool JsonBool(const std::string& body, const char* key) {
     return body.find(std::string("\"") + key + "\":true") != std::string::npos;
@@ -1051,6 +1057,10 @@ NickCheck::Result AskNickStatus(const std::string& server, const std::string& ni
     r.linked = JsonBool(body, "linked");
     r.link_available = JsonBool(body, "discord_link");
     r.discord = JsonField(body, "discord");
+    r.banned = JsonText(body, "banned");
+    r.ban_kind = JsonField(body, "ban_kind");
+    if (const auto at = body.find("\"ban_until\":"); at != std::string::npos)
+        r.ban_until = std::strtoll(body.c_str() + at + 12, nullptr, 10);
     return r;
 }
 
@@ -1107,9 +1117,41 @@ NickCheck::Result NickInfo() {
     return it == g_nick_check.results.end() ? NickCheck::Result{} : it->second;
 }
 
+constexpr const wchar_t* kCommunityDiscord = L"https://discord.gg/PAT5SJzdXw";
+
+/// The community's Discord (bugs, questions, ban appeals): a line and a button.
+void CommunityDiscordLine(const char* why) {
+    ImGui::TextColored(kGrey, "%s", why);
+    ImGui::SameLine();
+    if (ImGui::SmallButton(T("Abrir Discord", "Open Discord"))) OpenInShell(kCommunityDiscord);
+}
+
+/// This player's ban, as the server's nickname check tells it (nothing when not banned).
+bool BanNotice() {
+    const NickCheck::Result info = NickInfo();
+    if (info.banned.empty()) return false;
+    ImGui::PushStyleColor(ImGuiCol_Text, kRed);
+    ImGui::TextWrapped("%s", info.ban_kind == "ip" ? T("Tu conexión (IP) está baneada del online.", "Your connection (IP) is banned from online play.") : T("Tu cuenta está baneada del online.", "Your account is banned from online play."));
+    ImGui::TextWrapped(T("Motivo: %s", "Reason: %s"), info.banned.c_str());
+    if (info.ban_until > 0) {
+        char when[32];
+        const std::time_t t = std::time_t(info.ban_until);
+        std::tm local{};
+        localtime_s(&local, &t);
+        std::strftime(when, sizeof when, "%Y-%m-%d %H:%M", &local);
+        ImGui::TextWrapped(T("Hasta: %s", "Until: %s"), when);
+    } else {
+        ImGui::TextWrapped("%s", T("Duración: permanente", "Duration: permanent"));
+    }
+    ImGui::PopStyleColor();
+    CommunityDiscordLine(T("Si crees que es un error, apela en nuestro Discord.", "If you think it is a mistake, appeal on our Discord."));
+    return true;
+}
+
 /// One line under a nickname field: what the server says about it.
 void NickAvailabilityLine() {
     const std::string s = NickAvailability();
+    if (BanNotice()) return;
     if (s == "?") {
         ImGui::TextColored(kGrey, "%s", T("Comprobando el apodo en el servidor...", "Checking the nickname with the server..."));
     } else if (s == "free") {
@@ -1219,6 +1261,11 @@ std::string NatLabel(const std::string& server, ImVec4& color) {
     }
     color = kGrey;
     if (running) return std::string("NAT: ") + T("comprobando...", "checking...");
+    if (r.replies_blocked || r.error == "server") {
+        color = kRed;
+        return r.replies_blocked ? T("NAT: online bloqueado (¿firewall?)", "NAT: online blocked (firewall?)")
+                                 : T("NAT: el servidor no responde", "NAT: no answer from the server");
+    }
     switch (r.type) {
     case NatCheck::Type::Open: color = kGreen; return T("NAT: tipo 1 (abierto)", "NAT: type 1 (open)");
     case NatCheck::Type::Moderate: color = kGreen; return T("NAT: tipo 2 (moderado)", "NAT: type 2 (moderate)");
@@ -2102,6 +2149,7 @@ constexpr std::pair<const char*, const char*> kIniPatches[] = {
     {"CrashTeamRacing.xml/Resolution Patch (1080p for PS4 Pro)", "patch_pro_1080p"},
     {"CrashTeamRacingUnlockAll.xml/Unlock Everything", "patch_unlock_all"},
     // The European edition's files: the same switches (scripts/patches.py BUNDLED_FILES).
+    {"CrashTeamRacingUnlockAllEU.xml/Unlock Everything", "patch_unlock_all"},
     {"CrashTeamRacingEU.xml/60 FPS Unlock", "patch_60fps"},
     {"CrashTeamRacingEU.xml/Disable Motion Blur", "patch_no_motion_blur"},
     {"CrashTeamRacingEU.xml/Resolution Patch (1080p for PS4 Pro)", "patch_pro_1080p"},
@@ -2384,17 +2432,8 @@ void PlayTab() {
                 std::string srv = a.game.Get("online_server", "octr.ryu7w7.xyz");
                 if (srv.empty()) srv = "octr.ryu7w7.xyz";
                 const std::string nick = CurrentNick().empty() ? std::string("-") : CurrentNick();
-                const std::string friends = a.game.Get("online_friends", "");
-                if (!friends.empty()) {
-                    ImGui::TextColored(ImVec4(0.35f, 0.75f, 1.0f, 1.0f), "[Online RyuNET] %s: %s  |  %s: %s  |  %s: %s",
-                                       T("Servidor", "Server"), srv.c_str(),
-                                       T("Apodo", "Nick"), nick.c_str(),
-                                       T("Amigos", "Friends"), friends.c_str());
-                } else {
-                    ImGui::TextColored(ImVec4(0.35f, 0.75f, 1.0f, 1.0f), "[Online RyuNET] %s: %s  |  %s: %s",
-                                       T("Servidor", "Server"), srv.c_str(),
-                                       T("Apodo", "Nick"), nick.c_str());
-                }
+                ImGui::TextColored(ImVec4(0.35f, 0.75f, 1.0f, 1.0f), "[Online RyuNET] %s: %s  |  %s: %s",
+                                   T("Servidor", "Server"), srv.c_str(), T("Apodo", "Nick"), nick.c_str());
                 {
                     ImVec4 nat_color;
                     const std::string nat = NatLabel(Trim(srv), nat_color);
@@ -2408,6 +2447,7 @@ void PlayTab() {
                                                   "Whether other players can connect to you directly. Details in the Online "
                                                   "tab. Your IP is not shown."));
                 }
+                if (!NickInfo().banned.empty()) ImGui::TextColored(kRed, "%s", T("Baneado del online: mira la pestaña Online.", "Banned from online play: see the Online tab."));
                 if (const char* problem = NickProblem(CurrentNick()))
                     ImGui::TextColored(kYellow, "%s %s", problem, T("Se te pedirá al pulsar Jugar.", "You will be asked when you press Play."));
             } else {
@@ -2532,6 +2572,16 @@ void PlayTab() {
                                             "The game is running. The first start compiles shaders and takes a while."));
     } else if (a.show_exit) {
         if (a.exit_code == 0 || a.stopped) ImGui::TextColored(kGrey, "%s", T("El juego se cerró.", "The game was closed."));
+        else if (a.exit_code == kUnsupportedGpuCode) {
+            ImGui::PushStyleColor(ImGuiCol_Text, kRed);
+            ImGui::TextWrapped("%s", T("Tu tarjeta gráfica o su driver no soporta Vulkan 1.3, que el juego necesita. Actualiza el "
+                                       "driver de la GPU; si ya es el último, la tarjeta es demasiado antigua para Windows (en "
+                                       "Linux, el driver Mesa da Vulkan 1.3 a muchas GPU antiguas).",
+                                       "Your graphics card or its driver doesn't support Vulkan 1.3, which the game needs. Update "
+                                       "the GPU driver; if it is already the latest, the card is too old for Windows (on Linux, "
+                                       "the Mesa driver gives Vulkan 1.3 to many older GPUs)."));
+            ImGui::PopStyleColor();
+        }
         else ImGui::TextColored(kRed, T("El juego se cerró con un error (código %lu). Mira el registro abajo o en last_run.log.",
                                         "The game ended with an error (code %lu). See the log below or last_run.log."),
                                 (unsigned long)a.exit_code);
@@ -2676,9 +2726,9 @@ void WidescreenSettings() {
     } else {
         if (GameChoiceCombo(label, "widescreen_output", super, "5120x1440", 16.0f)) SaveGameIni();
     }
-    ImGui::TextColored(kGrey, "%s", T("Menús, fondos y HUD centrado corregidos. Solo sin conexión y con la actualización 1.21, USA o Europa "
+    ImGui::TextColored(kGrey, "%s", T("Menús, fondos y HUD centrado corregidos. En línea o sin conexión con la actualización 1.21, USA o Europa "
         "(si no, el juego arranca en 16:9). Sin FSR ni DLSS; la resolución interna elige la variante.",
-        "Corrected menus, backgrounds and a centered HUD. Offline only, with the 1.21 update, USA or Europe "
+        "Corrected menus, backgrounds and a centered HUD. Online or offline, with the 1.21 update, USA or Europe "
         "(otherwise the game starts at 16:9). No FSR or DLSS; the internal resolution picks the variant."));
 }
 
@@ -3226,7 +3276,7 @@ void NatTypeSection(const std::string& server) {
                                    "3074 to this PC helps."));
         break;
     case NatCheck::Type::Unknown:
-        ImGui::TextColored(kGrey, "%s",
+        ImGui::TextColored(result.error == "server" ? kRed : kGrey, "%s",
                            result.error == "server" ? T("El servidor no respondió (¿está bien escrito? ¿UDP 3074 bloqueado?).",
                                                         "The server did not answer (is it spelled right? UDP 3074 blocked?).")
                            : result.error == "dns" ? T("No se encontró el servidor.", "The server was not found.")
@@ -3234,6 +3284,18 @@ void NatTypeSection(const std::string& server) {
                                                         "Could not compare (the STUN server did not answer).")
                                                     : T("No se pudo comprobar.", "Could not check."));
         break;
+    }
+    if (result.replies_blocked || result.error == "server") {
+        ImGui::PushStyleColor(ImGuiCol_Text, kRed);
+        ImGui::TextWrapped("%s", T("Tu red bloquea las respuestas del servidor (UDP 3074): el juego dirá \"Failed to initialize "
+                                   "network\" al entrar en Online. Permite sacredfire.exe en el Firewall de Windows (redes "
+                                   "privadas y públicas), revisa la protección de red del antivirus, reinicia el router o "
+                                   "prueba otra red (los datos del móvil).",
+                                   "Your network blocks the server's replies (UDP 3074): the game will say \"Failed to "
+                                   "initialize network\" when you enter Online. Allow sacredfire.exe in Windows Firewall "
+                                   "(private and public networks), check your antivirus' network protection, restart your "
+                                   "router or try another network (a phone hotspot)."));
+        ImGui::PopStyleColor();
     }
 }
 
@@ -3313,13 +3375,10 @@ void OnlineTab() {
             DiscordAccountSection();
         }
 
-        ImGui::SetNextItemWidth(ImGui::GetFontSize() * 24.0f);
-        if (ImGui::InputText(T("Amigos (Friends)", "Friends"), a.online_friends_buf, sizeof(a.online_friends_buf))) {
-            a.game.Set("online_friends", a.online_friends_buf);
-        }
-        if (ImGui::IsItemDeactivatedAfterEdit()) SaveGameIni();
-        HelpMarker(T("Lista de amigos para Partidas Privadas, separados por comas (ejemplo: ESDRONIX,Amigo2).",
-                     "List of friends for Private Matches, separated by commas (example: ESDRONIX,Friend2)."));
+        // Friends: the in-game menu's Friends tab (Insert / L3+R3) finds, adds and invites them;
+        // the names of the old Friends field (online_friends) get friend requests once.
+        ImGui::TextColored(kGrey, "%s", T("Amigos: dentro del juego, menú (Insert / L3+R3) > Amigos.",
+                                          "Friends: in the game, menu (Insert / L3+R3) > Friends."));
 
         // Which Pit Stop items (characters, skins, karts) count as yours online: the server's,
         // bought with coins and tied to the nickname, or the save's (run.py sends it at login).
@@ -3346,6 +3405,19 @@ void OnlineTab() {
 
         ImGui::EndDisabled();
     }
+
+    // The rules of the online, and where to report and appeal.
+    ImGui::SeparatorText(T("Reglas del online", "Online rules"));
+    for (const char* rule : {T("Nada de trampas: hacks, trainers, modificaciones de velocidad u objetos, ni tiempos falsos en los récords. Arruinan la partida de todos.", "No cheating: hacks, trainers, speed or item modifications, or fake leaderboard times. They ruin the game for everyone."), T("Respeta a los demás: sin apodos ofensivos, insultos ni acoso.", "Respect others: no offensive nicknames, insults or harassment."), T("No sabotees partidas ni abandones a propósito para molestar.", "Do not sabotage races or quit on purpose to annoy others."), T("Usa tu propio apodo: no te hagas pasar por otra persona.", "Use your own nickname: do not impersonate anyone."), T("¿Ves a alguien haciendo trampas? Repórtalo en el juego: menú (Insert / L3+R3) > Amigos > Reportar jugador.", "See someone cheating? Report them in the game: menu (Insert / L3+R3) > Friends > Report a player.")}) {
+        ImGui::Bullet();
+        ImGui::TextWrapped("%s", rule);
+    }
+    ImGui::TextColored(kYellow, "%s", T("Romper las reglas puede costarte tus récords y un ban del online, temporal o permanente, también por IP.", "Breaking the rules can cost you your records and a ban from online play, temporary or permanent, also by IP."));
+    CommunityDiscordLine(T("Errores, dudas o apelar un baneo: nuestro Discord", "Bugs, questions or a ban appeal: our Discord"));
+    // Record validation now; ranked play with ranks and MMR, tied to the server, later.
+    ImGui::TextColored(kGrey, "%s", T("Crash Team Rank: valida tus récords (próximamente, competitivo con rangos y MMR)", "Crash Team Rank: validate your records (ranked play with MMR coming)"));
+    ImGui::SameLine();
+    if (ImGui::SmallButton(T("Abrir página", "Open page"))) OpenInShell(L"https://crashteamrank.vercel.app");
 
     ImGui::SeparatorText("Discord");
     LauncherFlag("discord_rpc", T("Mostrar actividad en Discord", "Show activity on Discord"), true,

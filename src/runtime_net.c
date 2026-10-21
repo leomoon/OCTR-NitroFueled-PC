@@ -1,6 +1,7 @@
 #include "runtime_net.h"
 #include "runtime_net_overrides.h"
 #include "runtime_net_tunnel.h"
+#include "runtime_friends.h"
 #include "runtime.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -58,6 +59,7 @@ int32_t runtime_net_init(void) {
         g_net_initialized = 1;
         runtime_net_trace("sceNetInit completed");
     }
+    runtime_friends_start();
     return ORBIS_OK;
 }
 

@@ -5,6 +5,7 @@ import sys
 import xml.etree.ElementTree as ET
 import tempfile
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
@@ -13,6 +14,7 @@ import nitro_format as fmt
 import widescreen
 from nitro_components import copy_delta
 from patches import render_patches
+from widescreen_online import correct_markers
 
 
 def fake_archive(path, entries):
@@ -37,6 +39,31 @@ def entry(archive, patch, index):
 
 
 class WidescreenTests(unittest.TestCase):
+    def test_marker_hook_fits_every_variant_without_overlapping_writes(self):
+        for mode in widescreen.OUTPUTS:
+            folder = widescreen.DATA / ('ultrawide-' + mode)
+            for variant, flat in fmt.expanded_variants(fmt.validate_folder(folder)):
+                with self.subTest(mode=mode, variant=variant['id']):
+                    factor = next(o['factor'] for o in flat['operations'] if o['kind'] == 'shader_position_scale')
+                    xml = ET.parse(folder / flat['patches'][0]).getroot()
+                    original = {int(l.get('Address'), 0): bytes.fromhex(l.get('Value')) for l in xml.iter('Line')}
+                    correct_markers(xml, factor)
+                    lines = {int(l.get('Address'), 0): bytes.fromhex(l.get('Value')) for l in xml.iter('Line')}
+                    self.assertEqual(len(lines), 16)
+                    spans = sorted((a, a + len(b)) for a, b in lines.items())
+                    self.assertTrue(all(end <= next_start for (_, end), (next_start, _) in zip(spans, spans[1:])))
+                    hook = lines[0xdd7853]
+                    self.assertEqual(hook[0], 0xe8)
+                    self.assertEqual(0xdd7858 + struct.unpack_from('<i', hook, 1)[0], 0x67d780)
+                    blob = lines[0x67d4e5]
+                    # Both viewport constants are stored at the end of the generated hook.
+                    start = 0x67d780 - 0x67d4e5
+                    self.assertEqual(blob[start:start + 4], bytes.fromhex('4883ec08'))
+                    self.assertIn(struct.pack('<2f', .5, 1 / factor), blob[start:])
+                    if factor != .5:
+                        old = 0x67d7b0 - 0x67d4e5
+                        self.assertEqual(blob[old + 32:old + 52], original[0x67d4e5][old:old + 20])
+
     def test_resized_asset_reuses_original_bytes(self):
         delta = {'format': 'copy-delta-v1', 'source_bytes': 6, 'result_bytes': 8,
                  'operations': [['copy', 0, 3], ['bytes', '7879'], ['copy', 3, 3]]}
@@ -83,20 +110,42 @@ class WidescreenTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             widescreen.hud_scale([dict(ops[0], kind='shader_file')])
 
-    def test_not_used_for_16x9_other_editions_or_online(self):
+    def test_not_used_for_16x9_or_other_editions(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             ini = root / 'bbport.ini'
             for text, title, env in (('widescreen_layout=off\n', 'CUSA13795', {}),
-                                     ('widescreen_layout=21x9\n', 'CUSA12345', {}),
-                                     ('widescreen_layout=21x9\nonline=1\n', 'CUSA13795', {}),
-                                     ('widescreen_layout=21x9\n', 'CUSA13795', {'BB_ONLINE': '1'})):
+                                     ('widescreen_layout=21x9\n', 'CUSA12345', {})):
                 with self.subTest(text=text, title=title, env=env):
                     ini.write_text(text)
                     before = dict(env)
                     self.assertIsNone(widescreen.prepare(root / 'game', root / 'out', ini, env, title, '01.21', {}))
                     self.assertEqual(env, before)
                     self.assertFalse((root / 'out').exists())
+
+    def test_online_keeps_selected_layout_and_playlist(self):
+        for mode in widescreen.OUTPUTS:
+            manifest = fmt.validate_folder(widescreen.DATA / ('ultrawide-' + mode))
+            for online in ('0', '1'):
+                for via_env in (False, True):
+                    with self.subTest(mode=mode, online=online, via_env=via_env), tempfile.TemporaryDirectory() as tmp:
+                        root = Path(tmp)
+                        ini = root / 'bbport.ini'
+                        ini.write_text(f'widescreen_layout={mode}\nonline={online}\n')
+                        env = {'BB_ONLINE': online, 'BB_ONLINE_NAME': 'test'} if via_env else {}
+                        before = dict(env)
+                        base = {'/app0/archives/update2.pak': root / 'playlist.bbpatch'}
+                        made = {'/app0/archives/update2.pak': root / 'combined.bbpatch'}
+                        with patch.object(widescreen, 'sha', return_value=manifest['compatibility']['eboot_sha256'][0]), \
+                             patch.object(widescreen, 'archive_patches', return_value=made) as assets:
+                            result = widescreen.prepare(root / 'game', root / 'out', ini, env, 'CUSA13795', '01.21', base)
+                        self.assertIsNotNone(result)
+                        self.assertEqual(env, before)
+                        self.assertIn(f'online={online}', result['config'].read_text())
+                        self.assertEqual(result['archive_patches'], made)
+                        self.assertEqual(assets.call_args.args[4], base)
+                        self.assertIn('combined.bbpatch', widescreen.archive_list(base, result))
+                        self.assertIn('BB_HUD_SCALE', result['env'])
 
     def test_eu_data(self):
         sets = json.loads((widescreen.EU / 'assets.json').read_text(encoding='utf-8'))['sets']

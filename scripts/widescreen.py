@@ -17,9 +17,9 @@ What a layout changes, the game's files staying as they are:
   with them, out/widescreen/bbport.ini): the base PS4 path at 1080 (the variant sets the size),
   no temporal upscaler, and the ultrawide of bbport.ini off, since the layout sets the size.
 
-Only for the USA 1.21 executable the data was verified with, and offline for now (online with a
-layout has not been tested). Otherwise, or when an asset is not the expected one (a mod), the
-game starts as it would without a layout, and the reason is printed.
+For the verified USA and EU 1.21 executables, in online and offline mode. When an asset
+is not the expected one (a mod), the game starts as it would without a layout, and the
+reason is printed.
 
 GPL-2.0-or-later.
 """
@@ -37,6 +37,9 @@ import nitro_format as fmt
 import nitro_variant_settings  # noqa: F401  (nitro_format imports it when a layout is resolved)
 from archive_reader import Archive
 from nitro_components import payload_bytes, read_ini, sha, under
+from widescreen_startup import correct_text
+from widescreen_online import (NOTICE, REPORT, CHALLENGES, correct_notice, correct_report,
+                               correct_challenges, correct_markers)
 
 DATA = Path(__file__).resolve().parent / 'widescreen_data'
 OUTPUTS = {'21x9': ('3440x1440', '2560x1080'),
@@ -49,8 +52,7 @@ TITLE_ID, APP_VERSION = 'CUSA13795', '01.21'
 # moved (ultrawide_eu.json, port_meta). The HUD shaders are the same.
 EU_TITLE = 'CUSA14876'
 EU = DATA / 'eu'
-FORMAT = 1  # of the made archive patches (out/widescreen/*/stamp.json)
-ONLINE_TESTED = False
+FORMAT = 13  # target GrandPrixReport's native blue sprite; restore standings
 MESSAGES = sys.stdout  # run.sh reads the shell lines on stdout: its messages go to stderr
 
 
@@ -120,14 +122,18 @@ def port_meta(meta, port):
     return meta
 
 
-def archive_patches(game, out, folder, operations, base, data='nitro-mod.json'):
+def archive_patches(game, out, folder, operations, base, data='nitro-mod.json', text_factor=1.0):
     """{guest: patch file} of the layout's assets, made from the player's archives (and kept in
     them the patches of base, {guest: patch file}, for the same archives)."""
     groups = {}
+    operations = list(operations)
+    online_fixes = folder != EU
+    if online_fixes:
+        operations += json.loads((DATA / 'online-notices.json').read_text(encoding='utf-8'))
     for op in operations:
         groups.setdefault(op['archive'], []).append(op)
     archives = Path(game) / 'archives'
-    stamp = {'format': FORMAT, 'data': sha(folder / data),
+    stamp = {'format': FORMAT, 'data': sha(folder / data), 'startup_text_factor': text_factor,
              'archives': {name: [(archives / name).stat().st_size, (archives / name).stat().st_mtime_ns]
                           for name in sorted(groups)},
              'operations': hashlib.sha256(json.dumps(operations, sort_keys=True).encode()).hexdigest(),
@@ -151,7 +157,20 @@ def archive_patches(game, out, folder, operations, base, data='nitro-mod.json'):
                 if entry['path'] != op['asset']:
                     raise ValueError(f'{name}: entry {op["index"]} is not {op["asset"]}')
                 # Checked against the original's and the result's SHA-256 (nitro_components.py).
-                entries[op['index']] = payload_bytes(op, folder, a.extract(entry))
+                original = a.extract(entry)
+                if op['kind'] == 'online_notice':
+                    if hashlib.sha256(original).hexdigest() != op['original_sha256']:
+                        raise ValueError(f'{name}: unexpected notification asset')
+                    payload = correct_notice(original, text_factor)
+                else:
+                    payload = payload_bytes(op, folder, original)
+                if op['asset'].casefold() == 'ui/legal.igz':
+                    payload = correct_text(payload, text_factor)
+                if online_fixes and op['asset'] == REPORT:
+                    payload = correct_report(payload, text_factor)
+                if online_fixes and op['asset'] == CHALLENGES:
+                    payload = correct_challenges(payload, text_factor)
+                entries[op['index']] = payload
         finally:
             a.data.close()
             a._file.close()
@@ -176,9 +195,6 @@ def prepare(game, out, config, env, title_id, app_version, base_patches):
     if app_version != APP_VERSION or title_id not in (TITLE_ID, EU_TITLE):
         say(f'{label} is made for the 1.21 update ({TITLE_ID} or {EU_TITLE}); this game is {title_id} {app_version}: 16:9')
         return None
-    if not ONLINE_TESTED and env.get('BB_ONLINE', settings.get('online', '0')) == '1':
-        say(f'{label} is offline only for now: online starts at 16:9')
-        return None
     try:
         folder = DATA / ('ultrawide-' + layout)
         manifest = fmt.validate_folder(folder)
@@ -192,12 +208,12 @@ def prepare(game, out, config, env, title_id, app_version, base_patches):
             sets = json.loads((EU / 'assets.json').read_text(encoding='utf-8'))['sets']
             used = next(v for v in manifest['variants'] if v['id'] == variant)['useOperations']
             assets = [op for name in used for op in sets[name]]
-            made = archive_patches(game, out, EU, assets, base_patches, 'assets.json')
+            made = archive_patches(game, out, EU, assets, base_patches, 'assets.json', shaders[0]['factor'])
         else:
             if sha(Path(game) / 'eboot.bin') not in manifest['compatibility']['eboot_sha256']:
                 raise ValueError('the executable is not the USA 1.21 one the layout was verified with')
             assets = [op for op in flat['operations'] if op['kind'] == 'archive_asset']
-            made = archive_patches(game, out, folder, assets, base_patches)
+            made = archive_patches(game, out, folder, assets, base_patches, text_factor=shaders[0]['factor'])
         hud = hud_scale(shaders)
     except (OSError, ValueError, KeyError) as error:
         say(f'{label} not used ({error}): 16:9')
@@ -212,6 +228,8 @@ def prepare(game, out, config, env, title_id, app_version, base_patches):
         for meta in ET.parse(under(folder, rel)).getroot().iter('Metadata'):
             meta.set('isEnabled', 'true')
             xml.append(port_meta(meta, port) if eu else meta)
+    if not eu:
+        correct_markers(xml, shaders[0]['factor'])
     ET.ElementTree(xml).write(patches_dir / 'Widescreen.xml', encoding='utf-8', xml_declaration=True)
 
     # The settings the layout was made for, over the player's: they stay in bbport.ini.

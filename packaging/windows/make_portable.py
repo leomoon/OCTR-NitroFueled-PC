@@ -230,6 +230,12 @@ def main():
     dlls = closure([exe, caps])
     for path in dlls.values():
         shutil.copy2(path, folder / 'bin')
+    # The Vulkan loader (vulkan-1.dll, loaded at run time, so not in the closure): Windows keeps
+    # the one an old GPU driver installed, which can report only Vulkan 1.2 even where the GPU's
+    # current driver has 1.3 ("only 1.2 is supported by instance"). Next to the exe, ours is used.
+    loader = CLANG_BIN / 'vulkan-1.dll'
+    if loader.is_file():
+        shutil.copy2(loader, folder / 'bin')
     if dlss_files:
         for path in dlss_files:
             shutil.copy2(path, folder / 'bin')
