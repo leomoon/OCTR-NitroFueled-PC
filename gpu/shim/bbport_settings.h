@@ -92,6 +92,8 @@ inline constexpr const char* DlssModelNames[] = {"transformer", "cnn"};
 
 struct Values {
     std::array<std::array<char, 64>, ControllerPorts> ports{}; ///< guarded by PortsMutex()
+    /// split_auto: ports 2-4 without a controller chosen take the next connected one (runtime_pad.c).
+    std::atomic<bool> split_auto{true};
     std::atomic<MenuLanguage> menu_language{MenuLanguage::Russian};
     std::atomic<int> upscaler{UpscalerFsr3};
     std::atomic<int> preset{NativeAA};
@@ -105,6 +107,8 @@ struct Values {
     std::atomic<float> reactive_max{0.9f};
     std::atomic<int> debug_view{DebugNone};
     std::atomic<bool> show_fps{false};
+    /// show_ping: the round trip to the players in the online room, under the FPS counter.
+    std::atomic<bool> show_ping{false};
     /// RyuNET friends (the menu's Friends tab): no "friend online" notices; appear offline to
     /// friends (the server hides it); no friend notices at all.
     std::atomic<bool> friends_hide_activity{false};

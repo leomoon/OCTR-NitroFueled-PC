@@ -22,6 +22,7 @@
 #include <miniz.h>
 #include "bbport_settings.h"
 #include "../../src/runtime_friends.h"
+#include "../../src/runtime_net_ping.h"
 #include "imgui.h"
 #include "imgui_internal.h" // RegisterUserTexture: the trophy pictures
 #include "imgui_impl_vulkan.h"
@@ -265,6 +266,9 @@ void MenuSection(const char* label) {
 // Present rate for the FPS counter.
 std::chrono::steady_clock::time_point last_present{};
 float frame_ms_avg = 0.0f;
+// Heights of the corner counters last drawn (the ping counter goes under the FPS one, notices
+// under both); the ping one is 0 while it is not shown.
+float corner_fps_height = 0.0f, corner_ping_height = 0.0f;
 
 float PixelDensity(SDL_WindowID id);
 
@@ -495,7 +499,12 @@ void CommunityDiscordLine(const char* why) {
     if (ImGui::SmallButton(BbSettings::MenuText("Copy link", "Копировать"))) SDL_SetClipboardText(kCommunityDiscord);
 }
 
-// Friends tab > Report a player: to the server's administrators.
+// The Report tab's player (filled in by a search result's Report button in the Friends tab, which
+// also brings that tab up).
+char g_report_who[RF_NAME] = "";
+bool g_show_report_tab = false;
+
+// Report tab: a player, to the server's administrators.
 void ReportSection(const RfView& view, char (&who)[RF_NAME]) {
     static int reason = 0;
     static char comment[RF_REPORT_COMMENT] = "";
@@ -545,11 +554,82 @@ void ReportSection(const RfView& view, char (&who)[RF_NAME]) {
                                               "Ошибки, вопросы или обжалование бана: наш Discord"));
 }
 
+/// The players in the room the game talks to, with their round trip (src/runtime_net_ping.h), as
+/// lines of text: in the Room tab and in the corner counter (show_ping). Their count.
+int PingLines() {
+    PingPeer peers[PING_MAX_PEERS];
+    const int count = runtime_net_ping_view(peers, PING_MAX_PEERS);
+    int older = 0;
+    for (int i = 0; i < count; ++i) {
+        const PingPeer& p = peers[i];
+        if (p.ms == PING_OLDER_PORT) {
+            ++older;
+            continue;
+        }
+        const char* name = p.name[0] ? p.name : "...";
+        if (p.ms == PING_NO_ANSWER) {
+            ImGui::TextColored(kMenuGrey, "%s  -", name);
+            continue;
+        }
+        const ImVec4 color = p.ms < 80 ? kFriendGreen : p.ms < 150 ? kMenuYellow : ImVec4{1.0f, 0.42f, 0.38f, 1.0f};
+        ImGui::Text("%s", name);
+        ImGui::SameLine();
+        ImGui::TextColored(color, "%d ms", p.ms);
+    }
+    if (older) {
+        ImGui::TextColored(kMenuGrey, BbSettings::MenuText("+%d with an older version (no ping)",
+                                                           "+%d со старой версией (без пинга)"),
+                           older);
+    }
+    return count;
+}
+
+bool InOnlineRoom() {
+    PingPeer peers[PING_MAX_PEERS];
+    return runtime_net_ping_view(peers, PING_MAX_PEERS) > 0;
+}
+
+void RoomTab() {
+    auto& s = BbSettings::Get();
+    MenuSection(BbSettings::MenuText("Players in the room", "Игроки в комнате"));
+    if (!InOnlineRoom()) {
+        ImGui::TextDisabled("%s", BbSettings::MenuText("You are not in an online room right now.",
+                                                       "Сейчас вы не в онлайн-комнате."));
+    } else {
+        PingLines();
+    }
+    ImGui::Spacing();
+    bool ping = s.show_ping;
+    if (ImGui::Checkbox(BbSettings::MenuText("Ping counter in corner", "Счётчик пинга в углу"), &ping)) {
+        s.show_ping = ping;
+        BbSettings::Save();
+    }
+    ImGui::TextDisabled("%s", BbSettings::MenuText("Round trip to each player in your online room, in ms. Players with an "
+                                                   "older version show no ping.",
+                                                   "Задержка до каждого игрока в вашей онлайн-комнате, в мс. У игроков "
+                                                   "со старой версией пинга нет."));
+}
+
+void ReportTab() {
+    static RfView view;
+    static unsigned seen = ~0u;
+    if (const unsigned serial = runtime_friends_serial(); serial != seen) {
+        runtime_friends_view(&view);
+        seen = view.serial;
+    }
+    if (view.state == RF_OFF) {
+        ImGui::TextWrapped("%s", BbSettings::MenuText(
+                                     "Reporting a player needs online play on and a nickname of your own (launcher > Online).",
+                                     "Для жалобы нужен онлайн и свой ник (лаунчер > Онлайн)."));
+        return;
+    }
+    ReportSection(view, g_report_who);
+}
+
 void FriendsTab() {
     static RfView view;
     static unsigned seen = ~0u;
     static char query[RF_NAME] = "";
-    static char report_who[RF_NAME] = "";
     static std::string last_action;
     if (const unsigned serial = runtime_friends_serial(); serial != seen) {
         runtime_friends_view(&view);
@@ -711,7 +791,8 @@ void FriendsTab() {
         }
         ImGui::SameLine();
         if (ImGui::SmallButton(BbSettings::MenuText("Report", "Пожаловаться"))) {
-            std::snprintf(report_who, sizeof report_who, "%s", p.name);
+            std::snprintf(g_report_who, sizeof g_report_who, "%s", p.name);
+            g_show_report_tab = true;
         }
         ImGui::PopID();
     }
@@ -727,7 +808,6 @@ void FriendsTab() {
             ImGui::PopID();
         }
     }
-    ReportSection(view, report_who);
 }
 
 void Menu() {
@@ -1070,6 +1150,7 @@ void Menu() {
 
     MenuSection(BbSettings::MenuText("Other", "Прочее"));
     Checkbox(BbSettings::MenuText("FPS counter in corner", "Счётчик FPS в углу"), s.show_fps);
+    Checkbox(BbSettings::MenuText("Ping counter in corner", "Счётчик пинга в углу"), s.show_ping);
     {
         // Where trophy and friend notices show (NoticeBox), in NoticePosition order.
         const char* places[] = {BbSettings::MenuText("Top right", "Вверху справа"),
@@ -1109,6 +1190,18 @@ void Menu() {
     if (ImGui::BeginTabItem(BbSettings::MenuText("Friends", "Друзья"))) {
         FriendsTab();
         ImGui::EndTabItem();
+    }
+    if (ImGui::BeginTabItem(BbSettings::MenuText("Room", "Комната"))) {
+        RoomTab();
+        ImGui::EndTabItem();
+    }
+    {
+        const ImGuiTabItemFlags bring_up = g_show_report_tab ? ImGuiTabItemFlags_SetSelected : 0;
+        g_show_report_tab = false;
+        if (ImGui::BeginTabItem(BbSettings::MenuText("Report", "Пожаловаться"), nullptr, bring_up)) {
+            ReportTab();
+            ImGui::EndTabItem();
+        }
     }
 
     const bool picture_tab = ImGui::BeginTabItem(BbSettings::MenuText("Picture", "Изображение"));
@@ -1258,6 +1351,17 @@ void Menu() {
     if (ImGui::BeginTabItem(BbSettings::MenuText("Controllers", "Контроллеры"))) {
     MenuSection(BbSettings::MenuText("Controllers (split screen)", "Контроллеры (разделённый экран)"));
     {
+        bool split_auto = s.split_auto;
+        if (ImGui::Checkbox(BbSettings::MenuText("Assign controllers automatically (each one connected is the next player)",
+                                                 "Назначать контроллеры автоматически (каждый подключённый — следующий игрок)"),
+                            &split_auto)) {
+            s.split_auto = split_auto;
+            BbSettings::Save();
+        }
+        ImGui::TextDisabled("%s", BbSettings::MenuText("Players 2-4 left on (none) get the controllers in the order they were "
+                                                       "connected. Off: one person can switch controllers freely.",
+                                                       "Игроки 2-4 с (нет) получают контроллеры в порядке подключения. "
+                                                       "Выкл.: один человек может свободно менять контроллеры."));
         int count = 0;
         SDL_JoystickID* ids = SDL_GetGamepads(&count);
         // Identical controllers share one GUID and name: they are listed once ("x2"), and choosing
@@ -1467,6 +1571,26 @@ void FpsCounter() {
                 : s.upscaler == BbSettings::UpscalerFsr411 ? "FSR 4.1.1"
                 : s.upscaler == BbSettings::UpscalerTaa    ? "TAA"
                                                            : "");
+    corner_fps_height = ImGui::GetWindowHeight();
+    ImGui::End();
+}
+
+/// show_ping: the players in the online room and their round trip, in the top right corner under
+/// the FPS counter; nothing outside a room.
+void PingCounter() {
+    const ImGuiViewport* viewport = ImGui::GetMainViewport();
+    const float pad = 12.0f * base_scale;
+    const float below = BbSettings::Get().show_fps ? corner_fps_height + 6.0f * base_scale : 0.0f;
+    ImGui::SetNextWindowPos(
+        ImVec2(viewport->WorkPos.x + viewport->WorkSize.x - pad, viewport->WorkPos.y + pad + below),
+        ImGuiCond_Always, ImVec2(1.0f, 0.0f));
+    ImGui::SetNextWindowBgAlpha(0.5f);
+    ImGui::Begin("##ping", nullptr,
+                 ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize |
+                     ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoNav |
+                     ImGuiWindowFlags_NoFocusOnAppearing);
+    PingLines();
+    corner_ping_height = ImGui::GetWindowHeight() + 6.0f * base_scale;
     ImGui::End();
 }
 
@@ -1609,7 +1733,9 @@ void NoticeBox(const Notice& n, float age) {
                         where == BbSettings::NoticeBottomCentre;
     const float width = (centre ? 520.0f : 440.0f) * s, icon = 84.0f * s, pad = 14.0f * s;
     const float margin = 22.0f * s, slide = (1.0f - in) * 80.0f * s;
-    const float under_fps = where == BbSettings::NoticeTopRight && settings.show_fps ? 34.0f * s : 0.0f;
+    const float under_fps = where == BbSettings::NoticeTopRight
+                                ? (settings.show_fps ? 34.0f * s : 0.0f) + corner_ping_height
+                                : 0.0f;
     const float x = centre  ? viewport->WorkPos.x + viewport->WorkSize.x * 0.5f
                     : right ? viewport->WorkPos.x + viewport->WorkSize.x - margin
                             : viewport->WorkPos.x + margin;
@@ -1948,7 +2074,7 @@ bool Visible() {
         notice = !notices.empty();
     }
     return initialized && (menu_open || prompt_active || ultrawide_prompt || BbSettings::Get().show_fps ||
-                           AnnouncementActive() || notice);
+                           (BbSettings::Get().show_ping && InOnlineRoom()) || AnnouncementActive() || notice);
 }
 
 void Notify(const std::string& title, const std::string& name, const std::string& detail, int kind,
@@ -2012,6 +2138,10 @@ void Render(vk::CommandBuffer cmdbuf, vk::ImageView view, vk::Extent2D extent) {
     }
     if (BbSettings::Get().show_fps && !menu_open) {
         FpsCounter();
+    }
+    corner_ping_height = 0.0f;
+    if (BbSettings::Get().show_ping && !menu_open && InOnlineRoom()) {
+        PingCounter();
     }
     if (prompt_active && !menu_open) {
         TextPrompt();

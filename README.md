@@ -38,6 +38,9 @@ compile them; the few the recipe lacks are compiled when first seen and cached.
 
 | Release | What it brought |
 |---|---|
+| [v0.6.3](https://github.com/Ryu7w7/OCTR-NitroFueled-PC/releases/tag/v0.6.3) | Mod fixes: game mods start again without a 21:9/32:9 layout, "Apply and restart" works with mods, and loose mods work with the game on another drive |
+| [v0.6.2](https://github.com/Ryu7w7/OCTR-NitroFueled-PC/releases/tag/v0.6.2) | Mods load without copying the game (tcosi); ping counter in the corner and a Room tab in the in-game menu; online login goes through networks and antivirus filters that redirect it; GameBanana link on the Mods page |
+| [v0.6.1](https://github.com/Ryu7w7/OCTR-NitroFueled-PC/releases/tag/v0.6.1) | Xbox button prompts (option); split screen assigns controllers automatically and players 2-4 play as guests (no extra saves); ping of the players in the room (in-game menu); Report in its own tab; mouse buttons and the wheel in the key bindings; online works with a PC clock that is off, and the login is no longer held by antivirus web shields; a new folder can bring the settings, saves and nickname of another installation; a nickname taken by another installation on the same PC is recovered; the Mods page (tcosi); ultrawide on every 1.21 build the layout fits (tcosi); DLC on Linux (Vo1dTear); controller ownership in split screen (n0buholic) |
 | [v0.6](https://github.com/Ryu7w7/OCTR-NitroFueled-PC/releases/tag/v0.6) | Friends inside the game (search, requests, invitations, notices when they come online; the game's Invite button works); report players from the game, reviewed by the server's moderators (bans, cheated records removed); messages and announcements from the administrators as in-game notices; online rules and the community Discord in the launchers, which also say why a player is banned; online races end 30 s after the first player finishes; notice position and a notice when a new version is out; the Linux AppImage updates itself; NVIDIA laptops on Linux; a GPU without Vulkan 1.3 is named as such instead of code 23 (code 23 itself is not fixed); the NAT test detects networks that drop the server's replies; identical controllers in split screen. Versions 0.4.1 and older can no longer play online |
 | [v0.5.4](https://github.com/Ryu7w7/OCTR-NitroFueled-PC/releases/tag/v0.5.4) | Every race track in public matchmaking, at the same chance (Koala Carnival and the later Grand Prix tracks included); regional relays for the online tunnel; corrected 21:9 and 32:9 menus and centered HUD (tcosi; USA and EU 1.21, offline); CPUs without MOVBE/BMI1/LZCNT (Sandy and Ivy Bridge) can play; achievements with in-game notices and a launcher page; the in-game menu in Spanish, General tab first; a badly extracted game is reported instead of a code 3 (contributions from GetLostIn's repository by MetaHeart and Naif Alqurashi). Code 23 is not fixed and can still happen. |
 | [v0.5.3](https://github.com/Ryu7w7/OCTR-NitroFueled-PC/releases/tag/v0.5.3) | The European edition (CUSA14876, with or without its 1.21 update), online with the USA one; ultrawide screens; the first start prepares the game's shaders for your GPU (far fewer stalls in the first races); one more cause of the code 23 GPU hang removed (a stale GPU idle signal; code 23 itself is not fixed and can still happen); shadPS4 crash fixes; Bluetooth controllers no longer drop from rumble; the launcher checks for updates and installs them keeping your files; the Linux launcher gets the Windows options (volume, player per controller, window settings, more languages, patches) |
@@ -308,10 +311,35 @@ not include: with your own key (the same shadPS4 uses; paste it, or import it fr
 5568 MiB of direct memory) and takes its Pro rendering path; with the 1080p patch it renders
 at 1920×1080. Off by default: the Steam Deck is closer to a base PS4.
 
-**Mods:** loose-file mod folders (with the game's folders inside) are overlaid on the game
-folder at start, with enable switches and load order in `mods.json`
-(`scripts/mods.py`, [docs/MODS.md](docs/MODS.md), written for bbport). Further shadPS4-format
-patch files go into `patches/` or `BB_PATCHES_DIR`, selected through `patches.json`.
+**Mods (Windows):** the Mods page lists built-in patches first, followed by installed
+add-ons. Add `.pak`, `.zip`, `.xml` files or an unpacked folder to `mods/` beside the
+launcher, using Add files / Add folder or copying them there and pressing Reload.
+Manifest packages can combine assets and executable patches under one switch;
+creator descriptions appear when the card's chevron is expanded. Legacy `patches/`
+is still read. See the [creator and packaging guide](docs/mod-packaging.html) and
+[implementation notes](docs/mod-support.txt), also available from the Mods page.
+No actual mod payloads are bundled with this feature. Online compatibility is a
+package declaration, not a server approval or whitelist service.
+
+Enabled mods override matching relative paths through the engine's read-only file
+map and sparse archive overlays. The selected source game directory stays unchanged:
+no original game files are copied, linked, repacked or overwritten. Disabling mods
+restores source reads. Only mod payloads, generated metadata and separate user saves/
+shader caches are stored. This path requires the matching updated engine, not only
+new launcher scripts. Multiple versions of a stable mod ID appear once, using the
+newest validated version; older inputs remain
+available for rollback. Different content claiming the same selected version is
+reported as a conflict.
+
+Mods do not need an engine-version/hash allowlist. Older manifests containing
+those fields still load; the fields are no longer a launch gate. Engine features
+are negotiated automatically, while game executable hashes, resource checksums,
+XML signatures, conflicts and online declarations remain enforced.
+
+The existing loose-folder CLI loader and `mods.json` remain available for older
+workflows ([docs/MODS.md](docs/MODS.md), originally written for bbport). The unified
+Mods UI/import flow is Windows-only in this revision; AppImage `run.sh` integration
+is not included.
 
 ## AppImage (Steam Deck)
 

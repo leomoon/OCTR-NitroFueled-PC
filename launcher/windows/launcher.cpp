@@ -51,6 +51,7 @@
 #include "discord_link.h"
 #include "nat_check.h"
 #include "port_update.h"
+#include "settings_import.h"
 #include "discord_presence.h"
 #include "launcher_locales.h"
 
@@ -659,6 +660,7 @@ struct Backup {
 };
 
 struct PatchInfo {
+    std::string mod_name, mod_hash, mod_source, mod_description, mod_versions;
     std::string key, name, author, note, version;
     std::string title;  // the edition its file is for (CUSA13795, CUSA14876), "" for any game
     bool default_on = false;
@@ -738,6 +740,18 @@ struct App {
 };
 
 App g_app;
+
+/// Bringing the settings from another installation (settings_import.h, ImportPopup).
+enum class ImportState { Idle, Copying, Done, Failed };
+struct {
+    std::vector<fs::path> from;  // the installations found, the last played first
+    int choice = 0;
+    bool ask = false;            // open the question on the next frame
+    std::atomic<ImportState> state{ImportState::Idle};
+    std::string error;           // written before state turns Failed
+} g_import;
+
+bool RestartLauncher(const std::wstring& args);
 
 /// The title ID of the chosen game (the merged folder, else the update or the base game): the
 /// saves, the shader cache and the merged folder's name follow it. CUSA13795 when none is known.
@@ -855,11 +869,49 @@ bool WriteKeyFile(const fs::path& path, const std::string& key) {
     return bool(out);
 }
 
+std::string Lower(std::string s) {
+    for (char& c : s) c = char(std::tolower(static_cast<unsigned char>(c)));
+    return s;
+}
+
+/// Every key used on this PC (run.py known_keys), one per line next to the backup: a nickname
+/// the current key does not own may belong to another folder's (two installations, or the
+/// backup from an older one), and the nickname check switches to it (AskNickStatus).
+fs::path KeyringPath() {
+    const fs::path backup = BackupKeyPath();
+    return backup.empty() ? fs::path() : backup.parent_path() / L"ryunet_online_keys.txt";
+}
+
+std::vector<std::string> KnownKeys() {
+    std::vector<std::string> keys;
+    const fs::path path = KeyringPath();
+    if (path.empty()) return keys;
+    std::ifstream in(path, std::ios::binary);
+    for (std::string line; std::getline(in, line);) {
+        line = Lower(Trim(line));
+        if (line.size() == 64 && line.find_first_not_of("0123456789abcdef") == std::string::npos &&
+            std::find(keys.begin(), keys.end(), line) == keys.end())
+            keys.push_back(line);
+    }
+    return keys;
+}
+
+void RememberKey(const std::string& key) {
+    const fs::path path = KeyringPath();
+    if (path.empty() || key.size() != 64) return;
+    const std::vector<std::string> keys = KnownKeys();
+    if (std::find(keys.begin(), keys.end(), key) != keys.end()) return;
+    std::error_code ec;
+    fs::create_directories(path.parent_path(), ec);
+    std::ofstream(path, std::ios::binary | std::ios::app) << key << "\n";
+}
+
+std::mutex g_online_key_mutex;  // the server checks ask from background threads
+std::string g_online_key;
+
 std::string OnlineKey() {
-    static std::mutex mutex;  // the server checks ask from background threads
-    static std::string cached;
-    std::scoped_lock lock{mutex};
-    if (!cached.empty()) return cached;
+    std::scoped_lock lock{g_online_key_mutex};
+    if (!g_online_key.empty()) return g_online_key;
     const fs::path path = g_app.root / L"ryunet_online.key";
     const fs::path backup = BackupKeyPath();
     std::string key = ReadKeyFile(path);
@@ -875,8 +927,18 @@ std::string OnlineKey() {
     }
     if (ReadKeyFile(path) != key && !WriteKeyFile(path, key)) return {};
     if (ReadKeyFile(backup).empty()) WriteKeyFile(backup, key);  // never overwrites another folder's
-    cached = key;
-    return cached;
+    RememberKey(ReadKeyFile(backup));
+    RememberKey(key);
+    g_online_key = key;
+    return g_online_key;
+}
+
+/// This folder plays with another of this PC's keys from now on (the game reads the file too).
+bool UseOnlineKey(const std::string& key) {
+    std::scoped_lock lock{g_online_key_mutex};
+    if (!WriteKeyFile(g_app.root / L"ryunet_online.key", key)) return false;
+    g_online_key = key;
+    return true;
 }
 
 /// Server availability of a nickname: "free", "yours", "taken", "reserved", "invalid", or
@@ -891,17 +953,13 @@ struct NickCheck {
         std::string banned;           // the ban's reason when this player or address is banned
         std::string ban_kind;         // "player" or "ip"
         long long ban_until = 0;      // unix time; 0: permanent
+        bool key_switched = false;    // it was another installation's on this PC: its key is used now
     };
     std::mutex mutex;
     std::map<std::string, Result> results;  // "server|nick" -> answer
     std::string in_flight;
 };
 NickCheck g_nick_check;
-
-std::string Lower(std::string s) {
-    for (char& c : s) c = char(std::tolower(static_cast<unsigned char>(c)));
-    return s;
-}
 
 /// The server setting's host and HTTP port, split exactly as run.py does ("host" or "host:port").
 void SplitServer(const std::string& server, std::string& host, INTERNET_PORT& port) {
@@ -945,8 +1003,7 @@ std::string Sha256Hex(const std::string& msg, const std::string& key = {}) {
     return hex;
 }
 
-std::string ServerKey(const std::string& host) {
-    const std::string key = OnlineKey();
+std::string ServerKey(const std::string& host, const std::string& key) {
     if (key.size() != 64) return {};
     std::string raw(32, '\0');
     for (int i = 0; i < 32; ++i) raw[size_t(i)] = static_cast<char>(std::stoi(key.substr(i * 2, 2), nullptr, 16));
@@ -954,13 +1011,37 @@ std::string ServerKey(const std::string& host) {
 }
 
 /// What the server stores of the server key (its keyHash): the key requests are signed with.
-std::string ServerKeyHash(const std::string& host) {
-    const std::string key = ServerKey(host);
-    return key.empty() ? std::string() : Sha256Hex(key);
+/// key: one of this PC's keys (KnownKeys); the installation's own when empty.
+std::string ServerKeyHash(const std::string& host, const std::string& key = {}) {
+    const std::string server_key = ServerKey(host, key.empty() ? OnlineKey() : key);
+    return server_key.empty() ? std::string() : Sha256Hex(server_key);
+}
+
+/// Seconds to add to this PC's clock to get the RyuNET server's (run.py SERVER_CLOCK_OFFSET), from
+/// the Date of its answers. Signatures carry the time and the server takes them only within 5
+/// minutes of its own clock: with the PC's clock off, every signed request was refused and the
+/// player's own nickname read as taken.
+std::atomic<long long> g_server_clock_offset{0};
+
+/// An answer of the RyuNET server: its Date header sets g_server_clock_offset.
+void NoteServerClock(HINTERNET req) {
+    SYSTEMTIME date{};
+    DWORD size = sizeof date;
+    FILETIME file{};
+    if (!WinHttpQueryHeaders(req, WINHTTP_QUERY_DATE | WINHTTP_QUERY_FLAG_SYSTEMTIME, WINHTTP_HEADER_NAME_BY_INDEX,
+                             &date, &size, WINHTTP_NO_HEADER_INDEX) ||
+        !SystemTimeToFileTime(&date, &file))
+        return;
+    const long long ticks = (static_cast<long long>(file.dwHighDateTime) << 32) | file.dwLowDateTime;
+    const long long server = (ticks - 116444736000000000LL) / 10000000LL;  // 100 ns since 1601 -> Unix
+    const long long offset = server - static_cast<long long>(std::time(nullptr));
+    // The header has whole seconds: a few seconds either way change nothing.
+    g_server_clock_offset = offset > 5 || offset < -5 ? offset : 0;
 }
 
 /// X-RyuNET-Proof for one request (the server's nick_proof.go, run.py proof_header): the key
-/// never crosses the network, and the signature is good once, for a few minutes.
+/// never crosses the network, and the signature is good once, for a few minutes of the
+/// server's time.
 std::string ProofHeader(const std::string& key_hash, const char* method, const std::string& target) {
     unsigned char raw[16];
     if (key_hash.empty() || BCryptGenRandom(nullptr, raw, sizeof raw, BCRYPT_USE_SYSTEM_PREFERRED_RNG) != 0) return {};
@@ -970,48 +1051,59 @@ std::string ProofHeader(const std::string& key_hash, const char* method, const s
         nonce += kHex[b >> 4];
         nonce += kHex[b & 15];
     }
-    const std::string ts = std::to_string(static_cast<long long>(std::time(nullptr)));
+    const std::string ts = std::to_string(static_cast<long long>(std::time(nullptr)) + g_server_clock_offset.load());
     const std::string mac = Sha256Hex(ts + "\n" + nonce + "\n" + method + "\n" + target, key_hash);
     return mac.empty() ? std::string() : "1." + ts + "." + nonce + "." + mac;
 }
 
 /// A request to the RyuNET server's HTTP port, signed with this installation's key for that
 /// server; register also sends the key's hash (a Discord link takes it for a new installation).
-/// The body, or "" when the server could not be reached. Called from background threads.
+/// The body, or "" when the server could not be reached. A request signed with a clock found off
+/// by minutes goes again once: the server refuses it before doing anything. Called from
+/// background threads. with_key signs with another of this PC's keys (KnownKeys).
 std::string HttpRequest(const std::string& server, const wchar_t* method, const std::wstring& path,
-                        const std::string& form = {}, int timeout_ms = 3000, bool register_key = false) {
+                        const std::string& form = {}, int timeout_ms = 3000, bool register_key = false,
+                        const std::string& with_key = {}) {
     std::string host;
     INTERNET_PORT port = 0;
     SplitServer(server, host, port);
-    const std::string key_hash = ServerKeyHash(host);
-    const std::string proof = ProofHeader(key_hash, Narrow(method).c_str(), Narrow(path));
+    const std::string key_hash = ServerKeyHash(host, with_key);
     std::string body;
     HINTERNET session = WinHttpOpen(L"CTR-NitroFueled-PC launcher", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
                                     WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
     if (!session) return body;
     WinHttpSetTimeouts(session, timeout_ms, timeout_ms, timeout_ms, timeout_ms);
     HINTERNET conn = WinHttpConnect(session, Widen(host).c_str(), port, 0);
-    HINTERNET req = conn ? WinHttpOpenRequest(conn, method, path.c_str(), nullptr, WINHTTP_NO_REFERER,
-                                              WINHTTP_DEFAULT_ACCEPT_TYPES, 0)
-                         : nullptr;
-    std::wstring headers;
-    if (!proof.empty()) headers += L"X-RyuNET-Proof: " + Widen(proof) + L"\r\n";
-    if (register_key && !key_hash.empty()) headers += L"X-RyuNET-Key-Hash: " + Widen(key_hash) + L"\r\n";
-    if (!form.empty()) headers += L"Content-Type: application/x-www-form-urlencoded\r\n";
-    if (req && WinHttpSendRequest(req, headers.empty() ? WINHTTP_NO_ADDITIONAL_HEADERS : headers.c_str(),
-                                  headers.empty() ? 0 : DWORD(-1),
-                                  form.empty() ? WINHTTP_NO_REQUEST_DATA : const_cast<char*>(form.data()),
-                                  DWORD(form.size()), DWORD(form.size()), 0) &&
-        WinHttpReceiveResponse(req, nullptr)) {
-        DWORD avail = 0;
-        while (WinHttpQueryDataAvailable(req, &avail) && avail && body.size() < 4096) {
-            std::string chunk(avail, '\0');
-            DWORD got = 0;
-            if (!WinHttpReadData(req, chunk.data(), avail, &got) || !got) break;
-            body.append(chunk.data(), got);
+    for (int attempt = 1; conn && attempt <= 2; ++attempt) {
+        const long long offset = g_server_clock_offset.load();
+        const std::string proof = ProofHeader(key_hash, Narrow(method).c_str(), Narrow(path));
+        HINTERNET req = WinHttpOpenRequest(conn, method, path.c_str(), nullptr, WINHTTP_NO_REFERER,
+                                           WINHTTP_DEFAULT_ACCEPT_TYPES, 0);
+        std::wstring headers;
+        if (!proof.empty()) headers += L"X-RyuNET-Proof: " + Widen(proof) + L"\r\n";
+        if (register_key && !key_hash.empty()) headers += L"X-RyuNET-Key-Hash: " + Widen(key_hash) + L"\r\n";
+        if (!form.empty()) headers += L"Content-Type: application/x-www-form-urlencoded\r\n";
+        body.clear();
+        bool answered = false;
+        if (req && WinHttpSendRequest(req, headers.empty() ? WINHTTP_NO_ADDITIONAL_HEADERS : headers.c_str(),
+                                      headers.empty() ? 0 : DWORD(-1),
+                                      form.empty() ? WINHTTP_NO_REQUEST_DATA : const_cast<char*>(form.data()),
+                                      DWORD(form.size()), DWORD(form.size()), 0) &&
+            WinHttpReceiveResponse(req, nullptr)) {
+            answered = true;
+            NoteServerClock(req);
+            DWORD avail = 0;
+            while (WinHttpQueryDataAvailable(req, &avail) && avail && body.size() < 4096) {
+                std::string chunk(avail, '\0');
+                DWORD got = 0;
+                if (!WinHttpReadData(req, chunk.data(), avail, &got) || !got) break;
+                body.append(chunk.data(), got);
+            }
         }
+        if (req) WinHttpCloseHandle(req);
+        const long long moved = g_server_clock_offset.load() - offset;
+        if (!answered || proof.empty() || (moved <= 240 && moved >= -240)) break;
     }
-    if (req) WinHttpCloseHandle(req);
     if (conn) WinHttpCloseHandle(conn);
     WinHttpCloseHandle(session);
     return body;
@@ -1051,8 +1143,24 @@ bool JsonBool(const std::string& body, const char* key) {
 NickCheck::Result AskNickStatus(const std::string& server, const std::string& nick) {
     // {"status":"...","linked":..,"discord_link":..,"discord":".."}; a server without this
     // endpoint answers something else.
-    const std::string body = HttpGet(server, L"/ryunet/nick?name=" + Widen(nick));  // [A-Za-z0-9_-]
+    const std::wstring path = L"/ryunet/nick?name=" + Widen(nick);  // [A-Za-z0-9_-]
+    std::string body = HttpGet(server, path);
+    bool key_switched = false;
+    if (JsonField(body, "status") == "taken") {
+        // Another installation on this PC may own it (KnownKeys): this folder takes its key.
+        const std::string own = OnlineKey();
+        for (const std::string& key : KnownKeys()) {
+            if (key == own) continue;
+            const std::string other = HttpRequest(server, L"GET", path, {}, 3000, false, key);
+            if (JsonField(other, "status") == "yours" && UseOnlineKey(key)) {
+                body = other;
+                key_switched = true;
+                break;
+            }
+        }
+    }
     NickCheck::Result r;
+    r.key_switched = key_switched;
     r.status = JsonField(body, "status");
     r.linked = JsonBool(body, "linked");
     r.link_available = JsonBool(body, "discord_link");
@@ -1081,6 +1189,7 @@ std::string NickAvailability() {
         NickCheck::Result result = AskNickStatus(server, nick);
         result.at = GetTickCount64();
         std::scoped_lock done{g_nick_check.mutex};
+        if (result.key_switched) g_nick_check.results.clear();  // the other answers were for the old key
         g_nick_check.results[id] = result;
         g_nick_check.in_flight.clear();
     }).detach();
@@ -1157,6 +1266,9 @@ void NickAvailabilityLine() {
     } else if (s == "free") {
         ImGui::TextColored(kGreen, "%s", T("Disponible: será tuyo la primera vez que juegues online.",
                                            "Available: it becomes yours the first time you play online."));
+    } else if (s == "yours" && NickInfo().key_switched) {
+        ImGui::TextColored(kGreen, "%s", T("Este apodo es tuyo (recuperado de otra instalación de este PC).",
+                                           "This nickname is yours (recovered from another installation on this PC)."));
     } else if (s == "yours") {
         ImGui::TextColored(kGreen, "%s", T("Este apodo es tuyo.", "This nickname is yours."));
     } else if (s == "taken" && NickInfo().linked) {
@@ -1169,6 +1281,16 @@ void NickAvailabilityLine() {
                                          "Someone else already uses that nickname: choose another one."));
     } else if (s == "reserved" || s == "invalid") {
         ImGui::TextColored(kRed, "%s", T("El servidor no acepta ese apodo: elige otro.", "The server does not accept that nickname: choose another one."));
+    }
+    const long long clock_off = std::llabs(g_server_clock_offset.load());
+    if (clock_off > 240) {
+        ImGui::PushStyleColor(ImGuiCol_Text, kYellow);
+        ImGui::TextWrapped(T("La hora de este PC va %lld min desfasada: el online la corrige, pero activa la fecha y hora "
+                             "automáticas en la configuración de Windows.",
+                             "This PC's clock is %lld min off: online corrects it, but set the date and time to "
+                             "automatic in the Windows settings."),
+                           (clock_off + 30) / 60);
+        ImGui::PopStyleColor();
     }
 }
 
@@ -1980,8 +2102,11 @@ std::string FormatSize(std::uintmax_t bytes) {
 fs::path SaveRoot() {
     const fs::path base = g_app.root / L"user" / L"savedata";
     std::error_code ec;
+    // Player 1's; guest<N> holds split-screen players 2-4's, emptied each run (src/runtime_savedata.c).
+    if (fs::is_directory(base / L"1" / GameTitle(), ec)) return base / L"1" / GameTitle();
     for (fs::directory_iterator it(base, ec), end; !ec && it != end; it.increment(ec)) {
         std::error_code e2;
+        if (it->path().filename().wstring().rfind(L"guest", 0) == 0) continue;
         if (fs::is_directory(it->path() / GameTitle(), e2)) return it->path() / GameTitle();
     }
     return base / L"1" / GameTitle();
@@ -2164,7 +2289,7 @@ const char* RegionOf(const std::string& title) {
 
 std::string XmlUnescape(std::string s) {
     const std::pair<const char*, const char*> entities[] = {
-        {"&lt;", "<"}, {"&gt;", ">"}, {"&quot;", "\""}, {"&apos;", "'"}, {"&amp;", "&"}};
+        {"&lt;", "<"}, {"&gt;", ">"}, {"&quot;", "\""}, {"&apos;", "'"}, {"&#10;", "\n"}, {"&#13;", "\r"}, {"&#9;", "\t"}, {"&amp;", "&"}};
     for (const auto& [from, to] : entities) {
         for (size_t at = 0; (at = s.find(from, at)) != std::string::npos; at += std::strlen(to))
             s.replace(at, std::strlen(from), to);
@@ -2194,7 +2319,20 @@ std::map<std::string, std::string> XmlAttributes(const std::string& tag) {
     return out;
 }
 
+void ScanModPackages() {
+    App& a = g_app;
+    if (!a.python || a.game_running) return;
+    const fs::path script = a.root / L"scripts" / L"mod_packages.py";
+    if (!fs::is_regular_file(script)) return;
+    const std::wstring cmd = Quote(a.python->exe) + L" " + a.python->args + L"-X utf8 " +
+        Quote(script.wstring()) + L" --scan " + Quote(a.root.wstring());
+    const Captured r = RunCaptured(a.python->exe, cmd, a.root, 120000);
+    if (!r.output.empty()) AddLog(r.output);
+    if (!r.started || r.code != 0) AddLog("Mod scan failed; check the log before enabling packages.");
+}
+
 std::vector<PatchInfo> LoadPatches() {
+    ScanModPackages();
     std::vector<PatchInfo> list;
     std::error_code ec;
     std::vector<fs::path> files;
@@ -2238,6 +2376,11 @@ std::vector<PatchInfo> LoadPatches() {
             std::string on = get("isEnabled");
             std::transform(on.begin(), on.end(), on.begin(), [](unsigned char c) { return char(std::tolower(c)); });
             p.default_on = on == "true";
+            p.mod_name = get("ModName");
+            p.mod_hash = get("ModHash");
+            p.mod_source = get("ModSource");
+            p.mod_description = get("ModDescription");
+            p.mod_versions = get("ModVersions");
             for (const auto& [key, ini] : kIniPatches)
                 if (p.key == key) p.ini_key = ini;
             list.push_back(std::move(p));
@@ -2842,6 +2985,11 @@ void SettingsTab() {
     GameFlag("borderless", T("Ventana sin bordes", "Borderless window"), false,
              T("Quita los bordes de la ventana en modo ventana.", "Removes window borders in windowed mode."));
     GameFlag("show_fps", T("Contador de FPS en la esquina", "FPS counter in the corner"), false);
+    GameFlag("show_ping", T("Contador de ping en la esquina", "Ping counter in the corner"), false,
+             T("En una sala online, el ping de cada jugador en ms, debajo del contador de FPS. También en el menú "
+               "del juego (Insert o L3+R3), pestaña Sala.",
+               "In an online room, each player's ping in ms, under the FPS counter. Also in the in-game menu "
+               "(Insert or L3+R3), Room tab."));
     {
         std::scoped_lock lock{a.mutex};
         const std::string current = a.launcher.Get("display");
@@ -2947,6 +3095,27 @@ void SettingsTab() {
                      "the controller stays player 1 and the keyboard plays player 2 (Space is Cross). If you play on "
                      "the keyboard alone, leave it on Player 1. The in-game menu (Insert or L3+R3) changes it too."));
     }
+    // bbport.ini button_prompts (scripts/button_prompts.py): the buttons the game shows.
+    {
+        static constexpr Choice kButtonPrompts[] = {
+            {"PlayStation", "PlayStation", "playstation"},
+            {"Xbox", "Xbox", "xbox"},
+        };
+        if (GameChoiceCombo(T("Iconos de botones", "Button prompts"), "button_prompts", kButtonPrompts, "playstation", 12.0f))
+            SaveGameIni();
+        HelpMarker(T("Los botones que muestra el juego en menús y avisos. Xbox: A, B, X, Y, LB, RB, LT, RT y View. "
+                     "Se aplica al pulsar Jugar.",
+                     "The buttons the game shows in menus and prompts. Xbox: A, B, X, Y, LB, RB, LT, RT and View. "
+                     "Applies when you press Play."));
+    }
+    GameFlag("split_auto", T("Pantalla dividida: asignar los mandos automáticamente", "Split screen: assign controllers automatically"),
+             true,
+             T("Para jugar de 2 a 4 con varios mandos: cada mando que conectes es el siguiente jugador (el primero, el "
+               "jugador 1). Desactivado, una persona puede cambiar de mando cuando quiera, y los mandos de los jugadores "
+               "2-4 se eligen en el menú del juego (Insert o L3+R3), Controllers.",
+               "For 2 to 4 players with several controllers: each controller you connect is the next player (the first "
+               "one, player 1). Off, one person can switch controllers at will, and players 2-4's controllers are chosen "
+               "in the in-game menu (Insert or L3+R3), Controllers."));
     ImGui::TextColored(kGrey, "%s", T("Más mandos para la pantalla dividida: menú del juego (Insert o L3+R3), Controllers.",
                                       "More controllers for split screen: in-game menu (Insert or L3+R3), Controllers."));
 
@@ -3473,102 +3642,342 @@ void OnlineTab() {
     }
 }
 
-void PatchesTab() {
+std::string PackagePatchId(const PatchInfo& patch) {
+    const std::string prefix = "OCTR-Mod-Library.xml/Mod: ";
+    return patch.key.rfind(prefix, 0) == 0 ? patch.key.substr(prefix.size()) : std::string();
+}
+
+bool ModEnableToggle(bool& on) {
+    const ImVec2 size{46.0f, 24.0f};
+    ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 0.0f);
+    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0, 0, 0, 0));
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0, 0, 0, 0));
+    ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0, 0, 0, 0));
+    const bool changed = ImGui::Button("##mod_enabled", size);
+    ImGui::PopStyleColor(3);
+    ImGui::PopStyleVar();
+    if (changed) on = !on;
+    const ImVec2 p = ImGui::GetItemRectMin();
+    ImDrawList* draw = ImGui::GetWindowDrawList();
+    const ImU32 track = ImGui::GetColorU32(on ? ImVec4(0.19f, 0.77f, 0.97f, 1.0f)
+                                           : ImVec4(0.23f, 0.31f, 0.46f, 1.0f));
+    draw->AddRectFilled(p, {p.x + size.x, p.y + size.y}, track, size.y * 0.5f);
+    draw->AddCircleFilled({p.x + (on ? size.x - 12.0f : 12.0f), p.y + 12.0f}, 9.0f,
+                          ImGui::GetColorU32(on ? ImVec4(0.04f, 0.13f, 0.27f, 1) : ImVec4(0.75f, 0.82f, 0.94f, 1)));
+    if (ImGui::IsItemFocused()) draw->AddRect({p.x - 2, p.y - 2}, {p.x + size.x + 2, p.y + size.y + 2},
+                                             ImGui::GetColorU32(ImGuiCol_Text), 14.0f);
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", on ? T("Desactivar mod", "Disable mod")
+                                                                       : T("Activar mod", "Enable mod"));
+    return changed;
+}
+
+void ImportMods(const std::vector<fs::path>& inputs) {
     App& a = g_app;
-    ImGui::PushTextWrapPos(0.0f);
-    ImGui::TextColored(kGrey, "%s", T("Se aplican al iniciar el juego (o con \"Apply and restart\" del menú del juego).",
-                                      "Applied when the game starts (or with the in-game menu's \"Apply and restart\")."));
-    ImGui::PopTextWrapPos();
-    const bool neo = a.launcher.Flag("neo", false);
-    if (a.patches.empty()) {
-        ImGui::TextColored(kYellow, "%s", T("No hay parches en la carpeta patches.", "No patches in the patches folder."));
-    }
-    // Only the patches of the detected edition (the other's are for another executable).
-    const std::string game_title = Narrow(GameTitle());
-    ImGui::TextColored(kGreen, "%s",
-                       Format(T("Tu juego: versión %s (%s). Se muestran sus parches.",
-                                "Your game: %s edition (%s). Its patches are shown."),
-                              RegionOf(game_title), game_title).c_str());
-    for (const auto& p : a.patches) {
-        if (!p.title.empty() && p.title != game_title) continue;
-        // The online key patch follows the Online tab's switch (run.py turns it on).
-        if (p.key.find("Online: custom Demonware key") != std::string::npos) continue;
-        ImGui::PushID(p.key.c_str());
-        bool on;
-        if (p.ini_key) {
-            on = a.game.Flag(p.ini_key, false);
-        } else {
-            const bool listed_on = std::find(a.patch_enabled.begin(), a.patch_enabled.end(), p.key) != a.patch_enabled.end();
-            const bool listed_off = std::find(a.patch_disabled.begin(), a.patch_disabled.end(), p.key) != a.patch_disabled.end();
-            on = listed_on || (p.default_on && !listed_off);
-        }
-        const bool needs_neo = p.ini_key && std::strcmp(p.ini_key, "patch_pro_1080p") == 0;
-        if (needs_neo) {  // replaced by Settings > Internal resolution
-            ImGui::PopID();
+    size_t added = 0;
+    for (const auto& source : inputs) {
+        std::error_code ec;
+        std::wstring extension = source.extension().wstring();
+        std::transform(extension.begin(), extension.end(), extension.begin(), ::towlower);
+        if (!fs::is_directory(source) && extension != L".pak" && extension != L".zip" && extension != L".xml") {
+            a.notice = T("Añade archivos .pak, .zip, .xml o una carpeta.", "Add .pak, .zip, .xml files or a folder.");
             continue;
         }
-        // render_res decides the 1080p Pro patch (Settings > Internal resolution).
-        if (needs_neo) on = EffectiveRenderRes() == "1080" && neo;
-        ImGui::BeginDisabled(needs_neo);
-        const char* region = RegionOf(p.title);
-        const std::string label = *region ? p.name + " [" + region + "]" : p.name;
-        if (ImGui::Checkbox(label.c_str(), &on)) {
-            if (p.ini_key) {
-                a.game.Set(p.ini_key, on ? "1" : "0");
-                SaveGameIni();
-            } else {
-                auto drop = [&](std::vector<std::string>& v) { v.erase(std::remove(v.begin(), v.end(), p.key), v.end()); };
-                drop(a.patch_enabled);
-                drop(a.patch_disabled);
-                if (on) a.patch_enabled.push_back(p.key);
-                else if (p.default_on) a.patch_disabled.push_back(p.key);
-                WritePatchConfig(a.patch_enabled, a.patch_disabled);
-            }
+        const fs::path destination = a.root / L"mods" / source.filename();
+        fs::create_directories(a.root / L"mods", ec);
+        if (fs::exists(destination)) {
+            a.notice = T("Ya existe un mod con ese nombre. No se ha sobrescrito.",
+                         "A mod with that filename already exists. It was not overwritten.");
+            continue;
         }
-        ImGui::EndDisabled();
-        if (!p.author.empty()) {
-            ImGui::SameLine();
-            ImGui::TextColored(kGrey, "%s %s%s%s", T("de", "by"), p.author.c_str(), p.version.empty() ? "" : "  v",
-                               p.version.c_str());
-        }
-        ImGui::Indent();
-        ImGui::PushTextWrapPos(0.0f);
-        if (needs_neo) ImGui::TextColored(kGrey, "%s", T("Lo controla Ajustes > Resolución interna (1080p con el modo PS4 Pro).",
-                                                          "Controlled by Settings > Internal resolution (1080p with PS4 Pro mode)."));
-        if (p.ini_key && std::strcmp(p.ini_key, "patch_unlock_all") == 0) {
-            ImGui::TextColored(kYellow, "%s",
-                               T("Desbloquea lo que el juego da al cumplir sus condiciones de desbloqueo, con el mismo "
-                                 "interruptor que usaban las demos de feria (E3/PAX). El autor recomienda copiar antes tu "
-                                 "partida (pestaña Guardados). Se aplica al iniciar el juego.",
-                                 "Unlocks what the game grants when its unlock conditions are met, with the same switch "
-                                 "the trade-show demos (E3/PAX) used. The author advises backing up your save first "
-                                 "(Saves tab). Applied when the game starts."));
-        }
-        if (!p.note.empty()) ImGui::TextColored(kGrey, "%s", p.note.c_str());
-        ImGui::TextColored(kGrey, "%s", p.key.c_str());
-        ImGui::PopTextWrapPos();
-        ImGui::Unindent();
-        ImGui::PopID();
+        if (fs::is_directory(source)) fs::copy(source, destination, fs::copy_options::recursive, ec);
+        else fs::copy_file(source, destination, fs::copy_options::none, ec);
+        if (ec) {
+            a.notice = T("No se pudo importar el mod. Revisa el registro.", "Could not import the mod. Check the log.");
+            AddLog("Mod import: " + ec.message());
+        } else ++added;
     }
+    if (added) {
+        a.patches = LoadPatches();
+        ReadPatchConfig(a.patch_enabled, a.patch_disabled);
+        a.notice = T("Mods añadidos. Revisa la lista y actívalos para jugar.",
+                     "Mods added. Review the list and enable them to play.");
+    }
+}
 
-    ImGui::SeparatorText(T("Añadir parches", "Add patches"));
-    ImGui::PushTextWrapPos(0.0f);
-    ImGui::TextUnformatted(T("Copia archivos .xml de parches en formato shadPS4 (como los de PS-Game-Patch o GoldHEN) en la "
-                             "carpeta patches y pulsa Recargar. Solo aparecen los que son para CUSA13795 versión 01.21.",
-                             "Copy patch .xml files in shadPS4 format (like PS-Game-Patch's or GoldHEN's) into the patches "
-                             "folder and press Reload. Only those for CUSA13795 version 01.21 are listed."));
-    ImGui::TextColored(kGrey, "%s", T("Para tener el juego desbloqueado: activa Unlock Everything (arriba) o importa una partida "
-                                      "al 100% en la pestaña Guardados.",
-                                      "To have the game unlocked: turn on Unlock Everything (above) or import a 100% save in "
-                                      "the Saves tab."));
-    ImGui::PopTextWrapPos();
-    if (ImGui::Button(T("Abrir la carpeta de parches", "Open the patches folder"))) {
-        std::error_code ec;
-        fs::create_directories(a.root / L"patches", ec);
-        OpenInShell(a.root / L"patches");
+
+bool ModIsOn(const PatchInfo& p) {
+    const App& a = g_app;
+    if (p.ini_key) return a.game.Flag(p.ini_key, false);
+    const bool enabled = std::find(a.patch_enabled.begin(), a.patch_enabled.end(), p.key) != a.patch_enabled.end();
+    const bool disabled = std::find(a.patch_disabled.begin(), a.patch_disabled.end(), p.key) != a.patch_disabled.end();
+    return enabled || (p.default_on && !disabled);
+}
+
+bool VisibleMod(const PatchInfo& p) {
+    if (!p.title.empty() && p.title != Narrow(GameTitle())) return false;
+    if (p.key.find("Online: custom Demonware key") != std::string::npos) return false;
+    return !p.ini_key || std::strcmp(p.ini_key, "patch_pro_1080p") != 0;
+}
+
+void SetModOn(const PatchInfo& p, bool on) {
+    App& a = g_app;
+    if (p.ini_key) { a.game.Set(p.ini_key, on ? "1" : "0"); SaveGameIni(); return; }
+    auto drop = [&](std::vector<std::string>& v) { v.erase(std::remove(v.begin(), v.end(), p.key), v.end()); };
+    drop(a.patch_enabled); drop(a.patch_disabled);
+    if (on) a.patch_enabled.push_back(p.key);
+    else a.patch_disabled.push_back(p.key);
+    WritePatchConfig(a.patch_enabled, a.patch_disabled);
+}
+
+void ModHeading(const char* title) {
+    if (g_font_heading) ImGui::PushFont(g_font_heading, ImGui::GetStyle().FontSizeBase * 1.12f);
+    ImGui::TextUnformatted(title);
+    if (g_font_heading) ImGui::PopFont();
+}
+
+void ModSection(const char* title, bool builtin) {
+    int total = 0, on = 0;
+    for (const auto& p : g_app.patches) if (VisibleMod(p) && (p.ini_key != nullptr) == builtin) {
+        ++total; if (ModIsOn(p)) ++on;
+    }
+    ModHeading(title); ImGui::SameLine(0, 12);
+    ImGui::TextColored(ImVec4(.65f,.72f,.85f,1), T("%d de %d activos", "%d of %d on"),on,total);
+}
+
+bool ModCard(const PatchInfo& p) {
+    const bool package = !PackagePatchId(p).empty();
+    bool on = ModIsOn(p), remove = false;
+    ImGui::PushID(p.key.c_str());
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, on ? ImVec4(.075f,.19f,.38f,1) : ImVec4(.065f,.14f,.29f,1));
+    ImGui::PushStyleColor(ImGuiCol_Border, on ? ImVec4(.12f,.36f,.57f,1) : ImVec4(.12f,.21f,.36f,1));
+    ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 11);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(17,10));
+    ImGui::BeginChild("card", ImVec2(0,0), ImGuiChildFlags_Borders | ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysUseWindowPadding,
+                      ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+    ImGui::BeginDisabled(g_app.game_running || (package && !g_app.python));
+    if (ModEnableToggle(on)) SetModOn(p,on);
+    ImGui::EndDisabled();
+    ImGui::SameLine(0,18);
+    const float text_x = ImGui::GetCursorPosX();
+    const float top = ImGui::GetCursorPosY();
+    const float right = ImGui::GetWindowContentRegionMax().x;
+    static std::set<std::string> expanded;
+    const bool details = expanded.count(p.key) != 0;
+    const float action_width = package ? 76.0f : 32.0f;
+    // A separate text child wraps long names/metadata without colliding with actions.
+    ImGui::BeginChild("summary", ImVec2(std::max(80.0f,right-text_x-action_width-12),0), ImGuiChildFlags_AutoResizeY,
+                      ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+    if (g_font_heading) ImGui::PushFont(g_font_heading, 0);
+    ImGui::TextWrapped("%s", package ? p.mod_name.c_str() : p.name.c_str());
+    if (g_font_heading) ImGui::PopFont();
+    std::string meta;
+    const char* region = RegionOf(p.title);
+    if (*region && !package) meta = std::string(region) + "   ";
+    meta += p.author;
+    if (!p.version.empty()) meta += "  · v" + p.version;
+    if (ImGui::GetContentRegionAvail().x > ImGui::CalcTextSize(meta.c_str()).x + 12) ImGui::SameLine(0,10);
+    ImGui::TextColored(ImVec4(.65f,.73f,.87f,1), "%s",meta.c_str());
+    const char* description = nullptr;
+    if (p.ini_key && std::strcmp(p.ini_key,"patch_60fps")==0)
+        description = T("Ejecuta el juego a 60 FPS. La versión 2.0 también elimina el vsync de doble búfer.",
+                        "Runs the game at 60 FPS. Version 2.0 also removes double-buffer vsync.");
+    if (p.ini_key && std::strcmp(p.ini_key,"patch_no_motion_blur")==0)
+        description = T("Desactiva el desenfoque de movimiento de la cámara.","Turns off the camera motion blur effect.");
+    const bool unlock = p.ini_key && std::strcmp(p.ini_key,"patch_unlock_all")==0;
+    if (unlock) description = T("Desbloquea el contenido que el juego concede al cumplir sus condiciones, con el interruptor de las demos E3/PAX.",
+                               "Unlocks what the game normally grants for meeting its unlock conditions, using the same switch as the E3/PAX demos.");
+    if (details && description) ImGui::TextWrapped("%s",description);
+    if (unlock && details) {
+        ImGui::Spacing();
+        ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(.20f,.23f,.30f,1));
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,ImVec2(10,7));
+        ImGui::BeginChild("save_warning",ImVec2(0,0),ImGuiChildFlags_AutoResizeY|ImGuiChildFlags_AlwaysUseWindowPadding);
+        ImGui::TextColored(kYellow,"%s",T("Copia antes tu partida.","Back up your save first.")); ImGui::SameLine();
+        if (ImGui::TextLink(T("Abrir Guardados", "Open Saves tab"))) g_app.active_page=6;
+        ImGui::EndChild(); ImGui::PopStyleVar(); ImGui::PopStyleColor();
+    }
+    if (details && package) {
+        ImGui::Spacing();
+        ImGui::TextWrapped("%s", p.mod_description.empty()
+            ? T("El creador no ha añadido una descripción.","The creator has not provided a description.")
+            : p.mod_description.c_str());
+        ImGui::TextColored(ImVec4(.65f,.73f,.87f,1),"mods/%s",p.mod_source.c_str());
+        if (!p.mod_versions.empty()) ImGui::TextWrapped("%s",p.mod_versions.c_str());
+    }
+    if (details && !package) {
+        ImGui::Spacing();
+        if (!p.note.empty()) ImGui::TextWrapped("%s",p.note.c_str());
+        ImGui::TextColored(ImVec4(.65f,.73f,.87f,1),"%s",p.key.c_str());
+    }
+    ImGui::EndChild();
+    const float end_y = ImGui::GetCursorPosY();
+    ImGui::SetCursorPos(ImVec2(right-action_width,top));
+    if (package) {
+        ImGui::BeginDisabled(g_app.game_running || !g_app.python);
+        if (ImGui::Button("##remove",ImVec2(32,25))) remove=true;
+        const ImVec2 q=ImGui::GetItemRectMin();
+        const ImVec2 c{q.x+16,q.y+12};
+        auto* d=ImGui::GetWindowDrawList(); const ImU32 ink=ImGui::GetColorU32(ImGuiCol_Text);
+        d->AddRect({c.x-4,c.y-3},{c.x+4,c.y+6},ink,1);
+        d->AddLine({c.x-6,c.y-5},{c.x+6,c.y-5},ink);
+        d->AddLine({c.x-2,c.y-7},{c.x+2,c.y-7},ink);
+        d->AddLine({c.x-1,c.y-1},{c.x-1,c.y+4},ink);
+        d->AddLine({c.x+2,c.y-1},{c.x+2,c.y+4},ink);
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s",T("Quitar: se conserva una copia y las partidas.","Remove: keeps a recoverable copy and saves."));
+        ImGui::EndDisabled();
+    }
+    // Reserve the same top-right slot regardless of expansion or card height.
+    ImGui::SetCursorPos(ImVec2(right-32,top));
+    ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize,0);
+    ImGui::PushStyleColor(ImGuiCol_Button,ImVec4(0,0,0,0));
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered,ImVec4(0,0,0,0));
+    ImGui::PushStyleColor(ImGuiCol_ButtonActive,ImVec4(0,0,0,0));
+    if (ImGui::Button("##details",ImVec2(32,25))) {
+        if (details) expanded.erase(p.key); else expanded.insert(p.key);
+    }
+    const bool hovered=ImGui::IsItemHovered();
+    if (hovered) ImGui::SetTooltip("%s",details ? T("Ocultar detalles","Hide details") : T("Mostrar detalles","Show details"));
+    const ImVec2 origin=ImGui::GetItemRectMin();
+    const ImVec2 center{origin.x+16,origin.y+12.5f};
+    ImGuiStorage* storage=ImGui::GetStateStorage();
+    const ImGuiID rotation_id=ImGui::GetID("chevron_rotation");
+    const float target=expanded.count(p.key) ? 3.14159265f : 0.0f;
+    float angle=storage->GetFloat(rotation_id,details ? 3.14159265f : 0.0f);
+    angle+=(target-angle)*std::min(1.0f,ImGui::GetIO().DeltaTime*20.0f);
+    storage->SetFloat(rotation_id,angle);
+    const auto rotated=[&](float x,float y) {
+        return ImVec2(center.x+x*std::cos(angle)-y*std::sin(angle),center.y+x*std::sin(angle)+y*std::cos(angle));
+    };
+    auto* draw=ImGui::GetWindowDrawList();
+    const ImU32 ink=ImGui::GetColorU32(hovered ? ImVec4(.85f,.95f,1,1) : ImVec4(.65f,.77f,.91f,1));
+    draw->AddLine(rotated(-5,-2.5f),rotated(0,2.5f),ink,1.8f);
+    draw->AddLine(rotated(0,2.5f),rotated(5,-2.5f),ink,1.8f);
+    ImGui::PopStyleColor(3); ImGui::PopStyleVar();
+    ImGui::SetCursorPosY(std::max(end_y,top+26));
+    ImGui::Dummy(ImVec2(0,0));
+    ImGui::EndChild();
+    ImGui::PopStyleVar(2); ImGui::PopStyleColor(2); ImGui::PopID();
+    return remove;
+}
+
+bool ModActionIcon(const char* id, const char* tooltip, bool folder, float size) {
+    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0,0,0,0));
+    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding,6);
+    const bool clicked=ImGui::Button(id,ImVec2(size,size));
+    ImGui::PopStyleVar(); ImGui::PopStyleColor();
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip("%s",tooltip);
+    const ImVec2 a=ImGui::GetItemRectMin();
+    const ImVec2 c{a.x+size*.5f,a.y+size*.5f};
+    const ImU32 ink=ImGui::GetColorU32(ImVec4(.70f,.80f,.94f,1));
+    ImDrawList* draw=ImGui::GetWindowDrawList();
+    if (folder) {
+        draw->PathLineTo({c.x-8,c.y-5}); draw->PathLineTo({c.x-2,c.y-5});
+        draw->PathLineTo({c.x,c.y-2}); draw->PathLineTo({c.x+8,c.y-2});
+        draw->PathLineTo({c.x+8,c.y+6}); draw->PathLineTo({c.x-8,c.y+6});
+        draw->PathStroke(ink,ImDrawFlags_Closed,1.5f);
+    } else {
+        draw->PathArcTo(c,7,.65f,6.0f,24); draw->PathStroke(ink,0,1.5f);
+        draw->AddLine({c.x+6.8f,c.y-2},{c.x+6.8f,c.y-8},ink,1.5f);
+        draw->AddLine({c.x+6.8f,c.y-2},{c.x+1,c.y-2},ink,1.5f);
+    }
+    return clicked;
+}
+
+void ModsTab() {
+    App& a = g_app;
+    ImGui::PushStyleColor(ImGuiCol_Text,ImVec4(.83f,.88f,.97f,1));
+    ImGui::PushStyleColor(ImGuiCol_TextDisabled,ImVec4(.63f,.71f,.85f,1));
+    ModSection(T("Mods incluidos","Built-in mods"),true);
+    ImGui::Spacing();
+    for (const auto& p : a.patches) if (VisibleMod(p) && p.ini_key) ModCard(p);
+    ImGui::Dummy(ImVec2(0,14));
+    const float left=ImGui::GetCursorPosX();
+    const float right=ImGui::GetWindowContentRegionMax().x;
+    const float gap=ImGui::GetStyle().ItemSpacing.x;
+    const float icon_size=36.0f;
+    const float folder_width=ImGui::CalcTextSize(T("Añadir carpeta","Add folder")).x+24;
+    const float files_width=ImGui::CalcTextSize(T("+ Añadir archivos","+ Add files")).x+28;
+    const float toolbar_width=icon_size*2+folder_width+files_width+gap*3;
+    ImGui::BeginGroup();
+    ImGui::AlignTextToFramePadding();
+    ModSection(T("Tus mods y parches","Your mods & patches"),false);
+    ImGui::EndGroup();
+    const float heading_end=ImGui::GetItemRectMax().x-ImGui::GetWindowPos().x;
+    if (heading_end+24+toolbar_width<=right) ImGui::SameLine(right-toolbar_width);
+    else {
+        ImGui::Spacing();
+        ImGui::SetCursorPosX(std::max(left,right-toolbar_width));
+    }
+    ImGui::BeginGroup();
+    ImGui::BeginDisabled(a.game_running || !a.python);
+    if (ModActionIcon("##reload_mods",T("Recargar mods","Reload mods"),false,icon_size)) {
+        a.patches=LoadPatches(); ReadPatchConfig(a.patch_enabled,a.patch_disabled);
     }
     ImGui::SameLine();
-    if (ImGui::Button(T("Recargar", "Reload"))) {
+    if (ModActionIcon("##open_mods",T("Abrir carpeta de mods","Open mods folder"),true,icon_size)) {
+        std::error_code ec; fs::create_directories(a.root/L"mods",ec); OpenInShell(a.root/L"mods");
+    }
+    ImGui::SameLine();
+    if (ImGui::Button(T("Añadir carpeta","Add folder"),ImVec2(folder_width,icon_size)))
+        if (const auto folder=PickFolder(a.hwnd,L"Add mod folder",fs::path())) ImportMods({*folder});
+    ImGui::SameLine();
+    ImGui::PushStyleColor(ImGuiCol_Button,ImVec4(.17f,.72f,.94f,1));
+    ImGui::PushStyleColor(ImGuiCol_Text,ImVec4(.02f,.10f,.20f,1));
+    if (ImGui::Button(T("+ Añadir archivos","+ Add files"),ImVec2(files_width,icon_size)))
+        ImportMods(PickFiles(a.hwnd,L"Add mods or patches",L"Mods (*.pak;*.zip;*.xml)",L"*.pak;*.zip;*.xml"));
+    ImGui::PopStyleColor(2); ImGui::EndDisabled();
+    ImGui::EndGroup();
+    ImGui::Spacing();
+    std::string remove_id, remove_hash;
+    for (const auto& p : a.patches) if (VisibleMod(p) && !p.ini_key) {
+        if (ModCard(p)) { remove_id=PackagePatchId(p); remove_hash=p.mod_hash; }
+    }
+    ImGui::PushStyleColor(ImGuiCol_ChildBg,ImVec4(0.015f,0.13f,0.32f,0.82f));
+    ImGui::PushStyleColor(ImGuiCol_Border,ImVec4(.18f,.29f,.44f,1));
+    ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding,11);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,ImVec2(18,17));
+    ImGui::BeginChild("mod_drop_area",ImVec2(0,0),ImGuiChildFlags_Borders|ImGuiChildFlags_AutoResizeY|ImGuiChildFlags_AlwaysUseWindowPadding);
+    const auto centered = [](const char* text) {
+        const float available=ImGui::GetContentRegionAvail().x;
+        const float width=ImGui::CalcTextSize(text).x;
+        if (width<available) ImGui::SetCursorPosX(ImGui::GetCursorPosX()+(available-width)*.5f);
+        ImGui::TextWrapped("%s",text);
+    };
+    centered(T("Añade .pak, .zip, .xml o una carpeta con los botones de arriba.",
+               "Use the buttons above to add .pak, .zip or .xml files, or a folder."));
+    centered(T("Se copian a la carpeta mods junto al launcher.","They're copied into the mods folder next to the launcher."));
+    ImGui::Spacing();
+    const char* guide=T("Lee la guía de empaquetado","Read the packaging guide");
+    ImGui::SetCursorPosX(ImGui::GetCursorPosX()+std::max(0.0f,(ImGui::GetContentRegionAvail().x-ImGui::CalcTextSize(guide).x)*.5f));
+    if (ImGui::TextLink(guide)) OpenInShell(a.root/L"docs"/L"mod-packaging.html");
+    // The game's page on GameBanana, where the community shares its mods.
+    const char* gamebanana=T("Buscar mods en GameBanana","Find mods on GameBanana");
+    ImGui::SetCursorPosX(ImGui::GetCursorPosX()+std::max(0.0f,(ImGui::GetContentRegionAvail().x-ImGui::CalcTextSize(gamebanana).x)*.5f));
+    if (ImGui::TextLink(gamebanana)) OpenInShell(L"https://gamebanana.com/games/26138");
+    ImGui::EndChild(); ImGui::PopStyleVar(2); ImGui::PopStyleColor(2);
+    if (a.game_running) ImGui::TextColored(kYellow,"%s",T("Cierra el juego para cambiar mods.","Close the game to change mods."));
+    ImGui::PopStyleColor(2);
+    // Reload only after rendering: the loop's references must remain valid.
+    if (!remove_id.empty() && a.python) {
+        const bool valid_id = std::all_of(remove_id.begin(), remove_id.end(), [](unsigned char c) {
+            return (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-';
+        });
+        const bool valid_hash = remove_hash.size() == 64 && std::all_of(remove_hash.begin(), remove_hash.end(), [](unsigned char c) {
+            return (c >= 'a' && c <= 'f') || (c >= '0' && c <= '9');
+        });
+        if (!valid_id || !valid_hash) {
+            a.notice = T("Los datos del mod no son válidos. Pulsa Recargar.", "Mod details are invalid. Press Reload.");
+            return;
+        }
+        const std::wstring cmd = Quote(a.python->exe) + L" " + a.python->args + L"-X utf8 " +
+            Quote((a.root / L"scripts" / L"mod_packages.py").wstring()) + L" --scan " + Quote(a.root.wstring()) +
+            L" --remove " + Quote(Widen(remove_id)) + L" --expected-sha " + Quote(Widen(remove_hash));
+        const Captured r = RunCaptured(a.python->exe, cmd, a.root, 120000);
+        if (!r.output.empty()) AddLog(r.output);
+        a.notice = r.started && r.code == 0 ? T("Mod quitado. El mod y las partidas se han conservado.",
+                                                                  "Mod removed. The mod and saves have been kept.")
+                                           : T("No se pudo quitar el mod. Revisa el registro y pulsa Recargar.",
+                                               "Could not remove the mod. Check the log and press Reload.");
         a.patches = LoadPatches();
         ReadPatchConfig(a.patch_enabled, a.patch_disabled);
     }
@@ -4062,6 +4471,15 @@ const char* SdlKeyName(unsigned code) {
     return it == names.end() ? nullptr : it->second;
 }
 
+// Mouse buttons and wheel steps as captured keys: kMouseCode + SDL's button number (wheel 6 and 7),
+// with the names src/runtime_pad.c and tools/gpu_capabilities.c --read-input use.
+constexpr unsigned kMouseCode = 0x1000;
+const char* MouseKeyName(unsigned code) {
+    static const char* const names[] = {"Mouse Left", "Mouse Middle", "Mouse Right", "Mouse X1",
+                                        "Mouse X2",   "Wheel Up",     "Wheel Down"};
+    return code > kMouseCode && code <= kMouseCode + 7 ? names[code - kMouseCode - 1] : nullptr;
+}
+
 // How a key name reads in the launcher.
 std::string KeyLabel(const std::string& name) {
     static const std::map<std::string, std::pair<const char*, const char*>> labels = {
@@ -4076,6 +4494,11 @@ std::string KeyLabel(const std::string& name) {
         {"PageUp", {"Re Pág", "Page Up"}}, {"PageDown", {"Av Pág", "Page Down"}},
         {"`", {"Tecla a la izquierda del 1", "` key"}},
         {"NonUSBackslash", {"Tecla < >", "< > key"}}, {"Keypad Enter", {"Enter (teclado num.)", "Keypad Enter"}},
+        {"Mouse Left", {"Clic izquierdo", "Left click"}}, {"Mouse Right", {"Clic derecho", "Right click"}},
+        {"Mouse Middle", {"Clic central (rueda)", "Middle click (wheel)"}},
+        {"Mouse X1", {"Botón lateral 1 del ratón", "Mouse side button 1"}},
+        {"Mouse X2", {"Botón lateral 2 del ratón", "Mouse side button 2"}},
+        {"Wheel Up", {"Rueda arriba", "Wheel up"}}, {"Wheel Down", {"Rueda abajo", "Wheel down"}},
     };
     const auto it = labels.find(name);
     if (it != labels.end()) return T(it->second.first, it->second.second);
@@ -4113,7 +4536,8 @@ void KeyboardTab() {
             const unsigned code = got - 1;
             if (code == 0x01) {
                 g_key_capture = -1;  // Esc: cancel
-            } else if (const char* name = SdlKeyName(code); name && code != 0x152) {
+            } else if (const char* name = code > kMouseCode ? MouseKeyName(code) : SdlKeyName(code);
+                       name && code != 0x152) {
                 const KeyInput& in = kKeyInputs[capturing];
                 const std::string key = std::string("key.") + in.id;
                 auto keys = g_key_replace ? std::vector<std::string>{} : SplitKeys(a.game.Get(key));
@@ -4152,7 +4576,8 @@ void KeyboardTab() {
             ImGui::TableNextColumn();
             ImGui::AlignTextToFramePadding();
             if (capturing == i) {
-                ImGui::TextColored(kYellow, "%s", T("Pulsa una tecla... (Esc cancela)", "Press a key... (Esc cancels)"));
+                ImGui::TextColored(kYellow, "%s", T("Pulsa una tecla o un botón del ratón... (Esc cancela)",
+                                                    "Press a key or a mouse button... (Esc cancels)"));
             } else if (keys.empty()) {
                 ImGui::TextColored(kGrey, "%s", T("(sin tecla)", "(none)"));
             } else {
@@ -5062,23 +5487,8 @@ void PollUpdate() {
     if (g_update.stage == UpdateState::Done && !g_update.restart_sent) {
         g_update.restart_sent = true;
         SaveLauncher();
-        wchar_t self[MAX_PATH * 4]{};
-        GetModuleFileNameW(nullptr, self, DWORD(std::size(self)));
-        fs::path exe = self;
-        // The packaged launcher's name, if the running one is an older name next to it.
-        std::error_code ec;
-        const fs::path packaged = a.root / (std::wstring(kLauncherName) + L".exe");
-        if (fs::is_regular_file(packaged, ec)) exe = packaged;
-        std::wstring cmd = Quote(exe.wstring()) + L" --updated";
-        STARTUPINFOW si{sizeof si};
-        PROCESS_INFORMATION pi{};
-        if (CreateProcessW(exe.c_str(), cmd.data(), nullptr, nullptr, FALSE, 0, nullptr, a.root.c_str(), &si, &pi)) {
-            CloseHandle(pi.hThread);
-            CloseHandle(pi.hProcess);
-            PostQuitMessage(0);
-        } else {
+        if (!RestartLauncher(L"--updated"))
             a.notice = T("Actualizado. Cierra y vuelve a abrir el launcher.", "Updated. Close and open the launcher again.");
-        }
     }
 }
 
@@ -5752,9 +6162,112 @@ void TrophiesTab() {
     }
 }
 
+/// Restarts the launcher (after an update or bringing another installation's settings): the
+/// packaged name when it is next to the running one. False when it could not be started.
+bool RestartLauncher(const std::wstring& args) {
+    App& a = g_app;
+    wchar_t self[MAX_PATH * 4]{};
+    GetModuleFileNameW(nullptr, self, DWORD(std::size(self)));
+    fs::path exe = self;
+    std::error_code ec;
+    const fs::path packaged = a.root / (std::wstring(kLauncherName) + L".exe");
+    if (fs::is_regular_file(packaged, ec)) exe = packaged;
+    std::wstring cmd = Quote(exe.wstring()) + (args.empty() ? L"" : L" " + args);
+    STARTUPINFOW si{sizeof si};
+    PROCESS_INFORMATION pi{};
+    if (!CreateProcessW(exe.c_str(), cmd.data(), nullptr, nullptr, FALSE, 0, nullptr, a.root.c_str(), &si, &pi))
+        return false;
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+    PostQuitMessage(0);
+    return true;
+}
+
+/// Asked on the first start of a new folder when another installation is found (and from the
+/// Tools tab): copies its settings and data here (settings_import.h), then restarts.
+void ImportPopup() {
+    App& a = g_app;
+    if (g_import.ask && !a.game_running) {
+        ImGui::OpenPopup("import_settings");
+        g_import.ask = false;
+    }
+    if (!ImGui::BeginPopupModal("import_settings", nullptr, ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoTitleBar))
+        return;
+    const ImportState state = g_import.state;
+    ImGui::TextUnformatted(T("¿Traer tus ajustes de otra instalación?", "Bring your settings from another installation?"));
+    ImGui::PushTextWrapPos(ImGui::GetFontSize() * 30.0f);
+    ImGui::TextColored(kGrey, "%s", T("Se copian a esta carpeta tus ajustes, controles, apodo, carpeta del juego, partidas "
+                                      "guardadas, logros y DLC. La otra carpeta no se toca.",
+                                      "Your settings, controls, nickname, game folder, saves, trophies and DLC are copied into "
+                                      "this folder. The other folder is left as it is."));
+    ImGui::PopTextWrapPos();
+    if (g_import.choice >= int(g_import.from.size())) g_import.choice = 0;
+    ImGui::BeginDisabled(state == ImportState::Copying);
+    if (g_import.from.size() == 1) {
+        ImGui::TextUnformatted(PathText(g_import.from[0]).c_str());
+    } else {
+        ImGui::SetNextItemWidth(ImGui::GetFontSize() * 30.0f);
+        if (ImGui::BeginCombo("##import_from", PathText(g_import.from[size_t(g_import.choice)]).c_str())) {
+            for (int i = 0; i < int(g_import.from.size()); ++i)
+                if (ImGui::Selectable(PathText(g_import.from[size_t(i)]).c_str(), i == g_import.choice)) g_import.choice = i;
+            ImGui::EndCombo();
+        }
+    }
+    ImGui::EndDisabled();
+    if (state == ImportState::Copying) {
+        ImGui::TextColored(kYellow, "%s", T("Copiando...", "Copying..."));
+    } else if (state == ImportState::Failed) {
+        ImGui::TextColored(kRed, T("No se pudo copiar: %s", "Could not copy: %s"), g_import.error.c_str());
+    } else if (state == ImportState::Done) {
+        ImGui::CloseCurrentPopup();
+        if (!RestartLauncher(L""))
+            a.notice = T("Ajustes copiados. Cierra y vuelve a abrir el launcher.", "Settings copied. Close and open the launcher again.");
+    }
+    ImGui::BeginDisabled(state == ImportState::Copying);
+    if (ImGui::Button(T("Traer mis ajustes", "Bring my settings"))) {
+        g_import.state = ImportState::Copying;
+        const fs::path from = g_import.from[size_t(g_import.choice)], to = a.root;
+        std::thread([from, to] {
+            const std::string error = SettingsImport::Copy(from, to);
+            g_import.error = error;
+            g_import.state = error.empty() ? ImportState::Done : ImportState::Failed;
+        }).detach();
+    }
+    ImGui::SameLine();
+    if (ImGui::Button(T("No, empezar de cero", "No, start fresh"))) {
+        a.launcher.Set("import_offered", "no");
+        SaveLauncher();
+        g_import.state = ImportState::Idle;
+        ImGui::CloseCurrentPopup();
+    }
+    ImGui::EndDisabled();
+    ImGui::EndPopup();
+}
+
 void ToolsTab() {
     App& a = g_app;
     UpdateSection();
+    ImGui::SeparatorText(T("Otra instalación", "Another installation"));
+    ImGui::BeginDisabled(g_import.state == ImportState::Copying || a.game_running);
+    if (ImGui::Button(T("Traer ajustes de otra instalación...", "Bring settings from another installation..."))) {
+        if (const auto dir = PickFolder(a.hwnd, L"Otra instalación del port / Another installation of the port",
+                                        a.root.parent_path())) {
+            std::error_code ec;
+            if (SettingsImport::IsUsedInstall(*dir) && !fs::equivalent(*dir, a.root, ec)) {
+                g_import.from = {*dir};
+                g_import.choice = 0;
+                g_import.ask = true;
+            } else {
+                a.notice = T("Esa carpeta no es otra instalación del port usada (le falta run.py o sus ajustes).",
+                             "That folder is not another used installation of the port (no run.py or settings).");
+            }
+        }
+    }
+    ImGui::EndDisabled();
+    HelpMarker(T("Copia a esta carpeta los ajustes, controles, apodo, carpeta del juego, partidas guardadas, logros y DLC de "
+                 "otra carpeta del port (por ejemplo, la de una versión anterior). La otra carpeta no se toca.",
+                 "Copies the settings, controls, nickname, game folder, saves, trophies and DLC of another folder of the "
+                 "port (an older release's, say) into this one. The other folder is left as it is."));
     ImGui::SeparatorText(T("Carpetas y registro", "Folders and log"));
     if (ImGui::Button(T("Abrir last_run.log", "Open last_run.log"))) OpenInShell(a.root / L"last_run.log");
     ImGui::SameLine();
@@ -6079,7 +6592,7 @@ void Frame() {
     ImGui::TextColored(ImVec4(0.76f, 0.92f, 1.0f, 0.9f), "%s", T("MENÚ PRINCIPAL", "MAIN MENU"));
     ImGui::SetCursorPosY(ImGui::GetCursorPosY() + 8.0f);
     const char* pages[] = {T("Jugar", "Play"), T("Ajustes", "Settings"), "Online", T("Mando", "Gamepad"),
-                           T("Teclado", "Keyboard"), T("Parches", "Patches"), T("Guardados", "Saves"), "DLC",
+                           T("Teclado", "Keyboard"), "Mods", T("Guardados", "Saves"), "DLC",
                            T("Logros", "Achievements"), T("Herramientas", "Tools")};
     for (int i=0; i<10; ++i) {
         ImGui::SetCursorPosX(8.0f);
@@ -6096,8 +6609,9 @@ void Frame() {
     ImGui::EndChild();
     ImGui::SameLine(0.0f, 0.0f);
     ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.015f, 0.13f, 0.32f, 0.82f));
-    ImGui::BeginChild("menu_content", ImVec2(0, 0), ImGuiChildFlags_None);
-    ImGui::SetCursorPos(ImVec2(22.0f, 17.0f));
+    // Real child padding applies to every row, table, wrap edge and tab.
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(22.0f, 17.0f));
+    ImGui::BeginChild("menu_content", ImVec2(0, 0), ImGuiChildFlags_AlwaysUseWindowPadding);
     ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.91f, 0.97f, 1.0f, 1.0f));
     switch (a.active_page) {
     case 0: PlayTab(); break;
@@ -6105,7 +6619,7 @@ void Frame() {
     case 2: OnlineTab(); break;
     case 3: GamepadTab(); break;
     case 4: KeyboardTab(); break;
-    case 5: PatchesTab(); break;
+    case 5: ModsTab(); break;
     case 6: SavesTab(); break;
     case 7: DlcTab(); break;
     case 8: TrophiesTab(); break;
@@ -6113,6 +6627,7 @@ void Frame() {
     }
     ImGui::PopStyleColor();
     ImGui::EndChild();
+    ImGui::PopStyleVar();
     ImGui::PopStyleColor();
     ImGui::EndChild();
     ImGui::PopStyleColor();
@@ -6120,6 +6635,7 @@ void Frame() {
     SaveConfirmations();
     NickPopup();
     JoinServerPopup();
+    ImportPopup();
     if (a.confirm_clear_cache) {
         ImGui::OpenPopup("clear_cache");
         a.confirm_clear_cache = false;
@@ -6166,12 +6682,22 @@ void LoadState() {
         }
     }
     a.python = FindPython(a.root);
+    // A folder never used (no launcher.ini): another installation's settings are offered once.
+    const bool new_folder = !fs::exists(LauncherIni(), ec);
     // The portable package ships bbport.default.ini (an update unzipped over it keeps bbport.ini).
     if (!fs::exists(GameIni(), ec) && fs::is_regular_file(a.root / L"bbport.default.ini", ec)) {
         fs::copy_file(a.root / L"bbport.default.ini", GameIni(), ec);
     }
     a.launcher.Load(LauncherIni());
     a.game.Load(GameIni());
+    if (const fs::path backup = BackupKeyPath(); !backup.empty()) {
+        const fs::path installs = backup.parent_path() / L"installs.txt";
+        if (new_folder && a.launcher.Get("import_offered").empty()) {
+            g_import.from = SettingsImport::Previous(installs, a.root);
+            g_import.ask = !g_import.from.empty();
+        }
+        SettingsImport::Remember(installs, a.root);
+    }
     SyncOnlineBuffers();
     const std::string lang = a.launcher.Get("ui_language");
     g_language = lang.empty() ? "auto" : lang;
@@ -6306,6 +6832,21 @@ static LRESULT WINAPI WndProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam)
         const unsigned code = unsigned((lparam >> 16) & 0xff) | ((lparam & (1 << 24)) ? 0x100u : 0u);
         g_key_captured = code + 1;
         return 0;
+    }
+    // ...or the next mouse button or wheel step (kMouseCode + SDL's button number). "Change" acts
+    // on the button's release, so this is the click after it.
+    if (g_key_capture >= 0) {
+        unsigned button = 0;
+        if (msg == WM_LBUTTONDOWN) button = 1;
+        else if (msg == WM_MBUTTONDOWN) button = 2;
+        else if (msg == WM_RBUTTONDOWN) button = 3;
+        else if (msg == WM_XBUTTONDOWN) button = GET_XBUTTON_WPARAM(wparam) == XBUTTON1 ? 4 : 5;
+        else if (msg == WM_MOUSEWHEEL && GET_WHEEL_DELTA_WPARAM(wparam) != 0)
+            button = GET_WHEEL_DELTA_WPARAM(wparam) > 0 ? 6 : 7;
+        if (button) {
+            g_key_captured = kMouseCode + button + 1;
+            return msg == WM_XBUTTONDOWN ? TRUE : 0;
+        }
     }
     if (ImGui_ImplWin32_WndProcHandler(hwnd, msg, wparam, lparam)) return true;
     switch (msg) {

@@ -38,7 +38,81 @@ def entry(archive, patch, index):
     return archive_patch.view(archive, patch, offset | (extra & 0xFF) << 32, length)
 
 
+def fake_elf(code, at=0x80):
+    """A minimal eboot.elf: one load segment (vaddr 0, file offset 0x100) with code at vaddr `at`."""
+    elf = bytearray(0x200)
+    struct.pack_into('<Q', elf, 0x20, 0x40)          # program headers
+    struct.pack_into('<HH', elf, 0x36, 56, 1)
+    struct.pack_into('<IIQQQQQQ', elf, 0x40, 1, 5, 0x100, 0, 0, 0x100, 0x100, 0x1000)
+    elf[0x100 + at:0x100 + at + len(code)] = code
+    return bytes(elf)
+
+
+def signed_patch(signature, address=0x400080):
+    xml = ET.Element('Patch')
+    meta = ET.SubElement(xml, 'Metadata')
+    ET.SubElement(ET.SubElement(meta, 'PatchList'), 'Line', Type='bytes', Address=hex(address), Value='90',
+                  Signature=signature, SignatureOffset='0x0')
+    return xml
+
+
 class WidescreenTests(unittest.TestCase):
+    def test_misfit_needs_every_line_in_its_one_place(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            self.assertIn('no eboot.elf', widescreen.misfit(signed_patch('de ad be ef'), out))
+            (out / 'eboot.elf').write_bytes(fake_elf(b'\xde\xad\xbe\xef'))
+            self.assertIsNone(widescreen.misfit(signed_patch('de ad ?? ef'), out))
+            # Elsewhere in the executable (another build's addresses): still its one place.
+            self.assertIsNone(widescreen.misfit(signed_patch('de ad be ef', 0x400010), out))
+            self.assertIn('0 signature matches', widescreen.misfit(signed_patch('ca fe ba be'), out))
+            (out / 'eboot.elf').write_bytes(fake_elf(b'\xde\xad\xbe\xef\x00\xde\xad\xbe\xef'))
+            self.assertIn('2 signature matches', widescreen.misfit(signed_patch('de ad be ef', 0x400010), out))
+            unsigned = signed_patch('de ad be ef')
+            del next(unsigned.iter('Line')).attrib['Signature']
+            self.assertIn('no signature', widescreen.misfit(unsigned, out))
+
+    def test_executable_the_patches_do_not_fit_keeps_16x9(self):
+        # The base game's executable under a 1.21 param.sfo: a signature found twice.
+        for title in ('CUSA13795', 'CUSA14876'):
+            with self.subTest(title=title), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                ini = root / 'bbport.ini'
+                ini.write_text('widescreen_layout=21x9\n')
+                with patch.object(widescreen, 'misfit', return_value='patch site not found (2 signature matches)'), \
+                     patch.object(widescreen, 'archive_patches', return_value={}):
+                    self.assertIsNone(widescreen.prepare(root / 'game', root / 'out', ini, {}, title, '01.21', {}))
+
+    def test_alternate_executable_does_not_disable_layout(self):
+        for mode, title in ((m, t) for m in widescreen.OUTPUTS for t in ('CUSA13795', 'CUSA14876')):
+            with self.subTest(mode=mode, title=title), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                game = root / 'game'
+                game.mkdir()
+                (game / 'eboot.bin').write_bytes(b'alternate 1.21 executable')
+                ini = root / 'bbport.ini'
+                ini.write_text(f'widescreen_layout={mode}\nrender_res=1620\nonline=1\n')
+                base = {'/app0/archives/update2.pak': root / 'playlist.bbpatch'}
+                made = {'/app0/archives/update2.pak': root / 'combined.bbpatch'}
+                original_sha = widescreen.sha
+
+                def checked_sha(path):
+                    self.assertNotEqual(Path(path).name, 'eboot.bin')
+                    return original_sha(path)
+
+                # Its patches fit it (misfit: every signed line in its one place).
+                with patch.object(widescreen, 'sha', side_effect=checked_sha), \
+                     patch('game_check.image_sha256', side_effect=AssertionError('Unexpected executable hash gate')), \
+                     patch.object(widescreen, 'misfit', return_value=None), \
+                     patch.object(widescreen, 'archive_patches', return_value=made) as assets:
+                    plan = widescreen.prepare(game, root / 'out', ini, {}, title, '01.21', base)
+                self.assertIsNotNone(plan)
+                self.assertEqual(plan['archive_patches'], made)
+                self.assertEqual(assets.call_args.args[4], base)
+                lines = list(ET.parse(plan['patches_dir'] / 'Widescreen.xml').iter('Line'))
+                self.assertEqual(len(lines), 15 if title == 'CUSA14876' else 16)
+                self.assertTrue(all(line.get('Signature') for line in lines))
+
     def test_marker_hook_fits_every_variant_without_overlapping_writes(self):
         for mode in widescreen.OUTPUTS:
             folder = widescreen.DATA / ('ultrawide-' + mode)
@@ -137,6 +211,7 @@ class WidescreenTests(unittest.TestCase):
                         base = {'/app0/archives/update2.pak': root / 'playlist.bbpatch'}
                         made = {'/app0/archives/update2.pak': root / 'combined.bbpatch'}
                         with patch.object(widescreen, 'sha', return_value=manifest['compatibility']['eboot_sha256'][0]), \
+                             patch.object(widescreen, 'misfit', return_value=None), \
                              patch.object(widescreen, 'archive_patches', return_value=made) as assets:
                             result = widescreen.prepare(root / 'game', root / 'out', ini, env, 'CUSA13795', '01.21', base)
                         self.assertIsNotNone(result)

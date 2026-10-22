@@ -64,6 +64,10 @@ void Set(Values& v, const std::string& key, const std::string& value) {
         v.debug_view = std::clamp(i, 0, DebugViewCount - 1);
     } else if (key == "show_fps") {
         v.show_fps = i != 0;
+    } else if (key == "show_ping") {
+        v.show_ping = i != 0;
+    } else if (key == "split_auto") {
+        v.split_auto = i != 0;
     } else if (key == "friends_hide_activity") {
         v.friends_hide_activity = i != 0;
     } else if (key == "friends_hide_me") {
@@ -364,6 +368,7 @@ void Save() {
             put(("port." + std::to_string(p + 1)).c_str(), std::string(v.ports[size_t(p)].data()));
         }
     }
+    put("split_auto", flag(v.split_auto));
     put("menu_language", v.menu_language == MenuLanguage::Russian   ? "ru"
                          : v.menu_language == MenuLanguage::Spanish ? "es"
                                                                     : "en");
@@ -379,6 +384,7 @@ void Save() {
     put("reactive_max", fixed(v.reactive_max, 2));
     put("debug_view", std::to_string(v.debug_view.load()));
     put("show_fps", flag(v.show_fps));
+    put("show_ping", flag(v.show_ping));
     put("friends_hide_activity", flag(v.friends_hide_activity));
     put("friends_hide_me", flag(v.friends_hide_me));
     put("friends_no_notices", flag(v.friends_no_notices));

@@ -84,7 +84,9 @@ fi
 "$PYTHON" scripts/link_modules.py "$game" --out "$out" --modules libc.prx libSceFios2.prx libSceNpToolkit2.prx
 # SacredFire: symbol names for this eboot's host-side imports (shadPS4's aerolib list, fetched once).
 "$PYTHON" tools/gen_import_names.py --out "$out"
-"$PYTHON" scripts/content_profile.py "$game" --out "$out" --sku "${BB_CONTENT_SKU:-full}"
+# Optional DLC from the writable data directory (also used by the launcher).
+"$PYTHON" scripts/content_profile.py "$game" --out "$out" --sku "${BB_CONTENT_SKU:-full}" \
+    --dlc-dir "${BB_DLC_DIR:-$data/dlc}"
 # The shader recipe (shaders/recipe.zip): prepared for this GPU at the first start, from the game's
 # own shaders, so new tracks and racers do not stop the game to compile them (as run.py).
 # BB_SHADER_RECIPE=0 leaves it out; another path uses that recipe.
@@ -103,6 +105,11 @@ unset BB_ARCHIVE_PATCHES
 "$PYTHON" scripts/online_playlist.py "$game" --out "$out"
 base_patches=()
 if [[ -f $out/online_playlist.bbpatch ]]; then base_patches=(--base "$out/online_playlist.bbpatch"); fi
+# Xbox button prompts (bbport.ini button_prompts, scripts/button_prompts.py), as run.py: the fonts'
+# button image through archive patches, each keeping the patch before it for the same archive.
+while IFS= read -r patch; do
+    if [[ -n $patch ]]; then base_patches+=(--base "$patch"); fi
+done < <("$PYTHON" scripts/button_prompts.py "$game" --out "$out" --settings "$BB_CONFIG" "${base_patches[@]}")
 # A 21:9 or 32:9 layout (bbport.ini widescreen_layout, scripts/widescreen.py), as run.py: the
 # render path and the patches read its settings, and it adds its archive patches (the playlist's
 # kept in them), executable patch and HUD scale.

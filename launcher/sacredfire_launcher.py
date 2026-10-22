@@ -436,9 +436,11 @@ def set_game_title(game_dir):
 def save_root(user_dir):
     title = GAME_TITLE[0]
     base = Path(user_dir) / "savedata"
+    if (base / "1" / title).is_dir():
+        return base / "1" / title  # player 1's: guest<N> holds players 2-4's (src/runtime_savedata.c)
     try:
         for entry in sorted(base.iterdir()):
-            if (entry / title).is_dir():
+            if not entry.name.startswith("guest") and (entry / title).is_dir():
                 return entry / title
     except OSError:
         pass
@@ -1038,6 +1040,12 @@ class LauncherWindow(Adw.ApplicationWindow):
         screen.add(self.sharpness_row)
         self.fps_row = Adw.SwitchRow(title=tr("FPS counter in the corner"), active=self.ini.get("show_fps") == "1")
         screen.add(self.fps_row)
+        self.ping_row = Adw.SwitchRow(
+            title=tr("Ping counter in the corner"),
+            subtitle=tr("In an online room, each player's ping in ms, under the FPS counter. Also in the in-game menu "
+                        "(Insert or L3+R3), Room tab."),
+            active=self.ini.get("show_ping") == "1")
+        screen.add(self.ping_row)
         page.add(screen)
 
         sound = Adw.PreferencesGroup(title=tr("Sound"))
@@ -1317,6 +1325,9 @@ class LauncherWindow(Adw.ApplicationWindow):
         save_settings(s)
         self.ini, self.ini_lines = load_ini()
         self.ini["show_fps"] = "1" if self.fps_row.get_active() else "0"
+        self.ini["show_ping"] = "1" if self.ping_row.get_active() else "0"
+        self.ini["split_auto"] = "1" if self.split_auto_row.get_active() else "0"
+        self.ini["button_prompts"] = combo_value(self.button_prompts_row)
         self.ini["async_pipelines"] = "1" if self.async_row.get_active() else "0"
         self.ini["msaa"] = "1" if self.msaa_row.get_active() else "0"
         self.ini["borderless"] = "1" if self.borderless_row.get_active() else "0"
@@ -1343,6 +1354,11 @@ class LauncherWindow(Adw.ApplicationWindow):
         self.ini, self.ini_lines = load_ini()
         self.fill_patches()
         self.fps_row.set_active(self.ini.get("show_fps") == "1")
+        self.ping_row.set_active(self.ini.get("show_ping") == "1")
+        self.split_auto_row.set_active(self.ini.get("split_auto") != "0")
+        prompts = self.ini.get("button_prompts", "playstation")
+        self.button_prompts_row.set_selected(self.button_prompts_row.values.index(prompts)
+                                             if prompts in self.button_prompts_row.values else 0)
         self.async_row.set_active(self.ini.get("async_pipelines") == "1")
         self.msaa_row.set_active(self.ini.get("msaa") == "1")
         self.borderless_row.set_active(self.ini.get("borderless") == "1")
@@ -1353,7 +1369,7 @@ class LauncherWindow(Adw.ApplicationWindow):
             self.volume_scale.set_value(max(0, min(200, int(self.ini.get("volume", VOLUME_DEFAULT)))))
         except ValueError:
             pass
-        self.show_keyboard_player()
+        self.show_port_players()
         limit = self.ini.get("fps_limit", "60")
         values = self.fps_limit_row.values
         self.fps_limit_row.set_selected(values.index(limit) if limit in values else values.index("60"))
@@ -1385,25 +1401,44 @@ class LauncherWindow(Adw.ApplicationWindow):
     def build_controls_page(self):
         page = Adw.PreferencesPage()
         controls = Adw.PreferencesGroup(title=tr("Controller"),
-                                        description=tr("Any connected gamepad plus the keyboard; the one used last takes over. "
-                                                       "Split-screen ports are assigned in the in-game menu (Insert / L3+R3)."))
+                                        description=tr("Player 1 uses the selected controller. If it is disconnected, an assigned controller "
+                                                       "from Players 2–4 temporarily becomes Player 1. Players 2–4 play as guests: "
+                                                       "nothing is kept for them after the game closes. The in-game menu "
+                                                       "(Insert / L3+R3) can also change ports."))
         pads = connected_gamepads()
-        choices = [(tr("First connected"), "")] + [(name, guid) for guid, name in pads]
-        if self.settings["gamepad"] and self.settings["gamepad"] not in [g for g, _ in pads]:
-            choices.append((tr("{} (not connected)").format(self.settings["gamepad_name"] or self.settings["gamepad"]), self.settings["gamepad"]))
-        self.gamepad_row = combo_row(tr("Controller"), None, choices, self.settings["gamepad"])
+        primary = self.ini.get("port.1") or self.settings["gamepad"]
+        choices = [(tr("First available"), "")] + [(name, guid) for guid, name in pads]
+        if primary and primary not in [guid for guid, _name in pads]:
+            choices.append((tr("{} (not connected)").format(self.settings["gamepad_name"] or primary), primary))
+        self.gamepad_row = combo_row(tr("Player 1 controller"), None, choices, primary)
+        self.gamepad_row.connect("notify::selected", lambda *_: self.on_primary_controller())
         controls.add(self.gamepad_row)
-        # bbport.ini port.N=keyboard (N 2..4): that split-screen player plays on the keyboard and
-        # player 1 on the controller alone (src/runtime_pad.c). Player 1: the keyboard drives it too.
-        self.keyboard_player_row = combo_row(
-            tr("Keyboard"),
-            tr("For two players in split screen, one on the keyboard and one on a controller, choose Player 2: the "
-               "controller stays player 1 and the keyboard plays player 2 (Space is Cross). If you play on the "
-               "keyboard alone, leave it on Player 1. The in-game menu (Insert or L3+R3) changes it too."),
-            [(tr("Player 1 (with the controller)"), "1")] + [(tr("Player {}").format(n), str(n)) for n in (2, 3, 4)],
-            self.keyboard_player())
-        self.keyboard_player_row.connect("notify::selected", lambda *_: self.on_keyboard_player())
-        controls.add(self.keyboard_player_row)
+        self.port_rows = {}
+        for n in (2, 3, 4):
+            current = self.ini.get(f"port.{n}", "")
+            choices = [(tr("Not assigned"), ""), (tr("Keyboard"), "keyboard")]
+            choices += [(name, guid) for guid, name in pads]
+            if current and current not in [value for _label, value in choices]:
+                choices.append((tr("{} (not connected)").format(current), current))
+            row = combo_row(tr("Player {}").format(n), None, choices, current)
+            row.connect("notify::selected", lambda _row, _param, player=n: self.on_port_player(player))
+            self.port_rows[n] = row
+            controls.add(row)
+        # bbport.ini split_auto (src/runtime_pad.c): players 2-4 without a controller chosen take the
+        # next connected one.
+        self.split_auto_row = Adw.SwitchRow(
+            title=tr("Split screen: assign controllers automatically"),
+            subtitle=tr("Players 2–4 left on Not assigned take the other controllers in the order they were connected. "
+                        "Off, they are not used, and another controller you pick up takes over Player 1."),
+            active=self.ini.get("split_auto") != "0")
+        controls.add(self.split_auto_row)
+        # bbport.ini button_prompts (scripts/button_prompts.py): the buttons the game shows.
+        self.button_prompts_row = combo_row(
+            tr("Button prompts"),
+            tr("The buttons the game shows in menus and prompts. Xbox: A, B, X, Y, LB, RB, LT, RT and View. "
+               "Applies when you press Play."),
+            [("PlayStation", "playstation"), ("Xbox", "xbox")], self.ini.get("button_prompts", "playstation"))
+        controls.add(self.button_prompts_row)
         page.add(controls)
 
         # Bindings: "Change" waits for a key or button in a small window (bb-gpu-capabilities
@@ -1447,26 +1482,38 @@ class LauncherWindow(Adw.ApplicationWindow):
             page.add(group)
         return page
 
-    def keyboard_player(self):
-        """The split-screen player the keyboard plays ("1": with player 1's controller)."""
-        for n in (2, 3, 4):
-            if self.ini.get(f"port.{n}", "").strip().lower() == "keyboard":
-                return str(n)
-        return "1"
-
-    def on_keyboard_player(self):
-        chosen = combo_value(self.keyboard_player_row)
-        if chosen == self.keyboard_player():
+    def on_primary_controller(self):
+        chosen = combo_value(self.gamepad_row)
+        if chosen == (self.ini.get("port.1") or self.settings["gamepad"]):
             return
-        changes = {f"port.{n}": None for n in (2, 3, 4) if self.ini.get(f"port.{n}", "").strip().lower() == "keyboard"}
-        if chosen != "1":
-            changes[f"port.{chosen}"] = "keyboard"
-        self.set_ini(changes)
+        self.settings["gamepad"] = chosen
+        self.settings["gamepad_name"] = self.gamepad_row.get_selected_item().get_string() if chosen else ""
+        save_settings(self.settings)
+        self.set_ini({"port.1": chosen or None})
 
-    def show_keyboard_player(self):
-        current = self.keyboard_player()
-        if combo_value(self.keyboard_player_row) != current:
-            self.keyboard_player_row.set_selected(self.keyboard_player_row.values.index(current))
+    def on_port_player(self, player):
+        chosen = combo_value(self.port_rows[player])
+        if chosen == self.ini.get(f"port.{player}", ""):
+            return
+        changes = {f"port.{player}": chosen or None}
+        if chosen == "keyboard":
+            changes.update({f"port.{n}": None for n in (2, 3, 4) if n != player and
+                            self.ini.get(f"port.{n}", "").lower() == "keyboard"})
+        self.set_ini(changes)
+        self.show_port_players()
+
+    def show_port_players(self):
+        primary = self.ini.get("port.1") or self.settings["gamepad"]
+        if primary not in self.gamepad_row.values:
+            self.gamepad_row.get_model().append(tr("{} (not connected)").format(primary))
+            self.gamepad_row.values.append(primary)
+        self.gamepad_row.set_selected(self.gamepad_row.values.index(primary))
+        for n, row in self.port_rows.items():
+            current = self.ini.get(f"port.{n}", "")
+            if current not in row.values:
+                row.get_model().append(tr("{} (not connected)").format(current))
+                row.values.append(current)
+            row.set_selected(row.values.index(current))
 
     def binding_text(self, kind, value):
         names = [n.strip() for n in value.split(",") if n.strip()]
@@ -1503,7 +1550,7 @@ class LauncherWindow(Adw.ApplicationWindow):
             return
         row, _default = self.binding_rows[(kind, name)]
         row.set_subtitle(tr("Press a gamepad button… (Escape cancels)") if kind == "pad"
-                         else tr("Press a key… (Escape cancels)"))
+                         else tr("Press a key or a mouse button… (Escape cancels)"))
 
         def done(proc, result):
             try:
@@ -1802,7 +1849,7 @@ class LauncherWindow(Adw.ApplicationWindow):
     # --- DLC page ----------------------------------------------------------------------------
 
     def dlc_dir(self):
-        return DATA_DIR / "dlc"
+        return Path(os.environ.get("BB_DLC_DIR") or DATA_DIR / "dlc")
 
     def build_dlc_page(self):
         page = Adw.PreferencesPage()
@@ -2005,6 +2052,8 @@ class LauncherWindow(Adw.ApplicationWindow):
             text = tr("Checking the nickname with the server…")
         elif status == "free":
             text = tr("Available: it becomes yours the first time you play online.")
+        elif status == "yours" and info.get("key_switched"):
+            text = tr("This nickname is yours (recovered from another installation on this PC).")
         elif status == "yours" and linked:
             text = tr("This nickname is yours. Discord account: {}").format(info.get("discord") or "?")
         elif status == "yours":
@@ -2018,6 +2067,10 @@ class LauncherWindow(Adw.ApplicationWindow):
             text = tr("The server does not accept that nickname: choose another one.")
         else:
             text = tr("The server could not be asked (it checks again when you play).")
+        clock_off = abs(ryunet_http.clock_offset())
+        if clock_off > 240:
+            text += " " + tr("This PC's clock is {} min off: online corrects it, but set the date and time "
+                             "to automatic in the system settings.").format(round(clock_off / 60))
         self.nick_status_row.set_subtitle(GLib.markup_escape_text(text))
         idle = not self.discord_busy
         self.discord_link_button.set_visible(link_available and idle and nick_ok(nick) and status in ("free", "yours")

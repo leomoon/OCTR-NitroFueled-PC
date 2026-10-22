@@ -31,6 +31,7 @@ import re
 import sys
 import xml.etree.ElementTree as ET
 from pathlib import Path
+from struct import error as struct_error
 
 import archive_patch
 import nitro_format as fmt
@@ -133,8 +134,9 @@ def archive_patches(game, out, folder, operations, base, data='nitro-mod.json', 
     for op in operations:
         groups.setdefault(op['archive'], []).append(op)
     archives = Path(game) / 'archives'
+    from mod_file_paths import resolve
     stamp = {'format': FORMAT, 'data': sha(folder / data), 'startup_text_factor': text_factor,
-             'archives': {name: [(archives / name).stat().st_size, (archives / name).stat().st_mtime_ns]
+             'archives': {name: [str(resolve(archives / name)), resolve(archives / name).stat().st_size, resolve(archives / name).stat().st_mtime_ns]
                           for name in sorted(groups)},
              'operations': hashlib.sha256(json.dumps(operations, sort_keys=True).encode()).hexdigest(),
              'base': {g: sha(p) for g, p in sorted(base.items())}}
@@ -180,6 +182,29 @@ def archive_patches(game, out, folder, operations, base, data='nitro-mod.json', 
     return made
 
 
+def misfit(xml, out):
+    """Why the layout's executable patches do not fit this game's executable (out/eboot.elf, from
+    scripts/prepare.py), or None when every line finds its one place in it as scripts/patches.py
+    places signed lines. Any 1.21 build qualifies (the 5.05 and 6.72+ firmware builds have the code
+    at other addresses), but not a base-game executable under a 1.21 param.sfo: there patches.py
+    would skip a line's whole patch, and the menus and HUD made for the layout would show over a
+    16:9 game."""
+    import patches
+    try:
+        elf = (Path(out) / 'eboot.elf').read_bytes()
+    except OSError as error:
+        return f'no eboot.elf ({error.strerror})'
+    for meta in xml.iter('Metadata'):
+        for line in meta.iter('Line'):
+            if not line.get('Signature'):
+                return f'{line.get("Address")} has no signature'
+            try:
+                patches.locate(line, int(line.get('Address') or '', 0) - patches.EBOOT_BASE, elf)
+            except (ValueError, struct_error) as error:
+                return str(error)
+    return None
+
+
 def prepare(game, out, config, env, title_id, app_version, base_patches):
     """The launch with the layout bbport.ini picks: a dict with `config` (the settings file
     scripts/patches.py and the render path read), `patches_dir` (the executable variant),
@@ -202,16 +227,13 @@ def prepare(game, out, config, env, title_id, app_version, base_patches):
         shaders = [op for op in flat['operations'] if op['kind'].startswith('shader_')]
         port = eu_port() if eu else None
         if eu:
-            from game_check import image_sha256
-            if image_sha256(game) != port['image_sha256']:
-                raise ValueError('the executable is not the EU 1.21 one the layout was ported to')
+            # Any EU 1.21 build the executable patches fit (misfit, below).
             sets = json.loads((EU / 'assets.json').read_text(encoding='utf-8'))['sets']
             used = next(v for v in manifest['variants'] if v['id'] == variant)['useOperations']
             assets = [op for name in used for op in sets[name]]
             made = archive_patches(game, out, EU, assets, base_patches, 'assets.json', shaders[0]['factor'])
         else:
-            if sha(Path(game) / 'eboot.bin') not in manifest['compatibility']['eboot_sha256']:
-                raise ValueError('the executable is not the USA 1.21 one the layout was verified with')
+            # Any USA 1.21 build the executable patches fit (misfit, below).
             assets = [op for op in flat['operations'] if op['kind'] == 'archive_asset']
             made = archive_patches(game, out, folder, assets, base_patches, text_factor=shaders[0]['factor'])
         hud = hud_scale(shaders)
@@ -230,6 +252,10 @@ def prepare(game, out, config, env, title_id, app_version, base_patches):
             xml.append(port_meta(meta, port) if eu else meta)
     if not eu:
         correct_markers(xml, shaders[0]['factor'])
+    reason = misfit(xml, out)
+    if reason:
+        say(f'{label} not used (the executable is not a 1.21 build the layout fits: {reason}): 16:9')
+        return None
     ET.ElementTree(xml).write(patches_dir / 'Widescreen.xml', encoding='utf-8', xml_declaration=True)
 
     # The settings the layout was made for, over the player's: they stay in bbport.ini.
