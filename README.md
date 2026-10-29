@@ -41,6 +41,7 @@ compile them; the few the recipe lacks are compiled when first seen and cached.
 
 | Release | What it brought |
 |---|---|
+| [v0.7](https://github.com/Ryu7w7/OCTR-NitroFueled-PC/releases/tag/v0.7) | Native Vulkan engine as an experimental choice in the launcher (straightarrows), with a shader build window; Speed Mode for private rooms, synced to the players who join (n0buholic); loading screens about half as long (liblzma decoding, n0buholic, and a RAM cache); motion blur off by default; older GPUs start again; opt-in anonymous performance reports; foldable friends list; in-game Graphics menu, Quit Game, Skip intro and the MSAA sky lines fixed on NVIDIA (immaculatevibes2025) |
 | [v0.6.5](https://github.com/Ryu7w7/OCTR-NitroFueled-PC/releases/tag/v0.6.5) | Online item-box odds set by the server; 21:9/32:9 layouts render at the chosen internal resolution up to 4K (startupandhold); mods start at any internal resolution (Vo1dTear), EU mod packages (Majed-allababedi) and several name mods together (SoyAlejandroCalixto); no code 20 at a first start without GitHub; nicknames register behind ISP filters; GPUs without sparse buffers get a clear message |
 | [v0.6.4](https://github.com/Ryu7w7/OCTR-NitroFueled-PC/releases/tag/v0.6.4) | Mods checked at the code they change, so they work on more 1.21 dumps (tcosi); mods import from deep folders; no freeze when a controller connects or drops (SoyAlejandroCalixto); the Controllers tab shows each player's controller; Linux launcher with Achievements and Mods (Brony666); a racer's outfit no longer ends the game with code 3 |
 | [v0.6.3](https://github.com/Ryu7w7/OCTR-NitroFueled-PC/releases/tag/v0.6.3) | Mod fixes: game mods start again without a 21:9/32:9 layout, "Apply and restart" works with mods, and loose mods work with the game on another drive |
@@ -289,6 +290,13 @@ a file, clear the shader cache, Vulkan validation, extra environment), and shows
 output. `--play` starts the game with the saved settings and no window (Steam Deck game mode).
 The menu entry and the launcher use the game's own icon (`sce_sys/icon0.png`), copied from your
 game folder into your icon theme; the game window shows it too.
+
+**Native LZMA decoder (Linux).** Recognized CTR 01.21 executables use liblzma for independent
+archive blocks, keeping the original compressed game files and requiring no disk cache. The
+patch checks the decoder and its one-shot caller before installing; unsupported layouts and
+blocks retain the original decoder. Set `BB_NATIVE_LZMA=0` in the launcher's extra environment
+to compare or disable it. On hosts with at least 12 logical CPUs, the verified streaming queue
+uses six existing background workers instead of four. Source builds require liblzma 5.4 or newer (`xz` in `shell.nix`).
 
 **In-game menu** (Insert, or L3+R3 on the pad): game patches, controller ports for split
 screen, FPS limit, fullscreen, FPS counter, menu language. It is saved to `bbport.ini`; patches apply after a restart.

@@ -1186,6 +1186,7 @@ int main(int argc, char **argv) {
         runtime_set_report_hook(isa_report_hook);
         protect(stubs, stub_area, 5);
     }
+    runtime_lzma_patch(image, size);
     protect(traps, round_page((import_count + 1) * 32), 5);
     protect(image, round_page(size), 0);
     int executable_entry = 0;
@@ -1224,6 +1225,7 @@ int main(int argc, char **argv) {
     }
     runtime_cinematic_start(image);
     runtime_frontend_start(image);
+    if (!runtime_online_mode_start(image, size)) fail("native Online mode callback could not be installed");
     printf("Entering original x86-64 code at guest offset 0x%" PRIx64 "\n", entry);
     entered_game=1;
     struct { uint64_t argc; const char *argv[2]; } params = {1, {"/app0/eboot.bin", NULL}};

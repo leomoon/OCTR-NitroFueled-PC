@@ -23,6 +23,8 @@ void runtime_start(uint64_t capabilities);
 uintptr_t runtime_resolve(const char *name, int is_data);
 void runtime_report(void);
 void runtime_set_report_hook(void (*hook)(void));
+void runtime_lzma_patch(unsigned char *image, size_t size);
+void runtime_lzma_report(void);
 void runtime_finalize(void *dso);
 uintptr_t runtime_mutex_resolve(const char *name);
 void runtime_mutex_report(void);
@@ -93,6 +95,16 @@ int runtime_cinematic_cutscene(void); /* 1 while a cutscene plays (not a race's 
 void runtime_cinematic_cutscene_fill(void); /* cutscenes get a 16:9 field of view, not a crop */
 /* SacredFire: ultrawide title and customization screens (runtime_frontend.c). */
 void runtime_frontend_start(const unsigned char *image);
+int runtime_online_mode_start(unsigned char *image, size_t size);
+/* The private room's mode through RyuNET (runtime_room_mode.c): the host publishes its choice,
+ * a player who joins takes it, also when joining by invitation (no selector seen). */
+void runtime_online_mode_adopt(int speed);
+int runtime_online_mode_private_speed(void);
+int runtime_online_mode_in_private(void);
+void runtime_room_mode_hosting(void);
+void runtime_room_mode_joined(const char *session_id);
+void runtime_room_mode_left(void);
+int runtime_speed_race_active(void);
 /* SacredFire online: the running game's title id for the PSN data (runtime_services.c). */
 void runtime_np_set_title(const char *title_id);
 void runtime_file_report(void);

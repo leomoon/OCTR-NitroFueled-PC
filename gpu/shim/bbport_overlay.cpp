@@ -20,6 +20,7 @@
 #include <memory>
 #include <vector>
 #include <miniz.h>
+#include "bbport_perf.h"
 #include "bbport_settings.h"
 #include "../../src/runtime_friends.h"
 #include "../../src/runtime_net_ping.h"
@@ -63,6 +64,8 @@ namespace {
 std::mutex imgui_mutex; // the ImGui context: window thread (input) and present thread
 bool initialized = false;
 std::atomic<bool> menu_open{false};
+// OpenMenu (a game thread): opened on the window thread.
+std::atomic<bool> open_request{false};
 // SacredFire: the ultrawide question at start (first start, or every start with ultrawide_ask).
 std::atomic<bool> ultrawide_prompt{false};
 bool ultrawide_prompt_checked = false;
@@ -704,65 +707,6 @@ void FriendsTab() {
         }
     }
 
-    char title[64];
-    std::snprintf(title, sizeof title, BbSettings::MenuText("Friends (%d)", "Друзья (%d)"), view.friend_count);
-    MenuSection(title);
-    if (!view.friend_count) {
-        ImGui::TextDisabled("%s", BbSettings::MenuText("No friends yet: search for a nickname below.",
-                                                       "Друзей пока нет: найдите ник ниже."));
-    }
-    static std::string confirm_remove;
-    for (int i = 0; i < view.friend_count; ++i) {
-        const RfFriend& f = view.friends[i];
-        ImGui::PushID(f.name);
-        ImGui::AlignTextToFramePadding();
-        StatusDot(f.online);
-        ImGui::SameLine();
-        ImGui::TextUnformatted(f.name);
-        ImGui::SameLine();
-        if (!f.online) {
-            ImGui::TextDisabled("%s", BbSettings::MenuText("Offline", "Не в сети"));
-        } else if (f.players > 1) {
-            ImGui::TextColored(green, BbSettings::MenuText("In a room (%d/%d)", "В комнате (%d/%d)"), f.players, f.max);
-        } else {
-            ImGui::TextColored(green, "%s", BbSettings::MenuText("Online", "В сети"));
-        }
-        if (f.online) {
-            ImGui::SameLine();
-            if (ImGui::Button(BbSettings::MenuText("Invite", "Пригласить"))) act("invite", f.name);
-        }
-        ImGui::SameLine();
-        if (confirm_remove == f.name) {
-            if (ImGui::Button(BbSettings::MenuText("Sure? Remove", "Точно удалить?"))) {
-                act("remove", f.name);
-                confirm_remove.clear();
-            }
-        } else if (ImGui::SmallButton(BbSettings::MenuText("Remove", "Удалить"))) {
-            confirm_remove = f.name;
-        }
-        ImGui::PopID();
-    }
-
-    MenuSection(BbSettings::MenuText("Options", "Настройки"));
-    {
-        auto& s = BbSettings::Get();
-        Checkbox(BbSettings::MenuText("Don't show friends' activity", "Не показывать активность друзей"),
-                 s.friends_hide_activity);
-        Hint(BbSettings::MenuText("No notice when a friend comes online.", "Без уведомлений, когда друг заходит в сеть."));
-        bool hide_me = s.friends_hide_me;
-        if (ImGui::Checkbox(BbSettings::MenuText("Don't show my activity", "Не показывать мою активность"), &hide_me)) {
-            Store(s.friends_hide_me, hide_me, true);
-            runtime_friends_set_hidden(hide_me);
-        }
-        Hint(BbSettings::MenuText("Your friends see you offline and get no notice when you come online.",
-                                  "Друзья видят вас не в сети и не получают уведомлений."));
-        Checkbox(BbSettings::MenuText("Don't show notifications", "Не показывать уведомления"), s.friends_no_notices);
-        Hint(BbSettings::MenuText("No friend notices (requests, invitations, friends online). This tab still shows "
-                                  "them.",
-                                  "Без уведомлений от друзей (запросы, приглашения, друзья в сети). Эта вкладка "
-                                  "их по-прежнему показывает."));
-    }
-
     MenuSection(BbSettings::MenuText("Add a friend", "Добавить друга"));
     ImGui::SetNextItemWidth(ImGui::GetFontSize() * 11.0f);
     const bool enter = ImGui::InputTextWithHint("##friend_search", BbSettings::MenuText("Nickname", "Ник"), query,
@@ -815,6 +759,91 @@ void FriendsTab() {
             ImGui::PopID();
         }
     }
+
+    char title[64];
+    std::snprintf(title, sizeof title, BbSettings::MenuText("Friends (%d)", "Друзья (%d)"), view.friend_count);
+    MenuSection(title);
+    if (!view.friend_count) {
+        ImGui::TextDisabled("%s", BbSettings::MenuText("No friends yet: search for a nickname above.",
+                                                       "Друзей пока нет: найдите ник выше."));
+    }
+    static std::string confirm_remove;
+    auto friend_row = [&](const RfFriend& f) {
+        ImGui::PushID(f.name);
+        ImGui::AlignTextToFramePadding();
+        StatusDot(f.online);
+        ImGui::SameLine();
+        ImGui::TextUnformatted(f.name);
+        ImGui::SameLine();
+        if (!f.online) {
+            ImGui::TextDisabled("%s", BbSettings::MenuText("Offline", "Не в сети"));
+        } else if (f.players > 1) {
+            ImGui::TextColored(green, BbSettings::MenuText("In a room (%d/%d)", "В комнате (%d/%d)"), f.players, f.max);
+        } else {
+            ImGui::TextColored(green, "%s", BbSettings::MenuText("Online", "В сети"));
+        }
+        if (f.online) {
+            ImGui::SameLine();
+            if (ImGui::Button(BbSettings::MenuText("Invite", "Пригласить"))) act("invite", f.name);
+        }
+        ImGui::SameLine();
+        if (confirm_remove == f.name) {
+            if (ImGui::Button(BbSettings::MenuText("Sure? Remove", "Точно удалить?"))) {
+                act("remove", f.name);
+                confirm_remove.clear();
+            }
+        } else if (ImGui::SmallButton(BbSettings::MenuText("Remove", "Удалить"))) {
+            confirm_remove = f.name;
+        }
+        ImGui::PopID();
+    };
+    // online friends first and open; offline ones folded (a long list hid everything below it)
+    int online = 0;
+    for (int i = 0; i < view.friend_count; ++i) {
+        online += view.friends[i].online ? 1 : 0;
+    }
+    if (view.friend_count) {
+        char head[64];
+        std::snprintf(head, sizeof head, BbSettings::MenuText("Online (%d)###friends_online", "В сети (%d)###friends_online"), online);
+        if (ImGui::CollapsingHeader(head, ImGuiTreeNodeFlags_DefaultOpen)) {
+            if (!online) {
+                ImGui::TextDisabled("%s", BbSettings::MenuText("No friends online.", "Нет друзей в сети."));
+            }
+            for (int i = 0; i < view.friend_count; ++i) {
+                if (view.friends[i].online) friend_row(view.friends[i]);
+            }
+        }
+        if (view.friend_count > online) {
+            std::snprintf(head, sizeof head, BbSettings::MenuText("Offline (%d)###friends_offline", "Не в сети (%d)###friends_offline"),
+                          view.friend_count - online);
+            if (ImGui::CollapsingHeader(head)) {
+                for (int i = 0; i < view.friend_count; ++i) {
+                    if (!view.friends[i].online) friend_row(view.friends[i]);
+                }
+            }
+        }
+    }
+
+    ImGui::Spacing();
+    if (ImGui::CollapsingHeader(BbSettings::MenuText("Options", "Настройки"))) {
+        auto& s = BbSettings::Get();
+        Checkbox(BbSettings::MenuText("Don't show friends' activity", "Не показывать активность друзей"),
+                 s.friends_hide_activity);
+        Hint(BbSettings::MenuText("No notice when a friend comes online.", "Без уведомлений, когда друг заходит в сеть."));
+        bool hide_me = s.friends_hide_me;
+        if (ImGui::Checkbox(BbSettings::MenuText("Don't show my activity", "Не показывать мою активность"), &hide_me)) {
+            Store(s.friends_hide_me, hide_me, true);
+            runtime_friends_set_hidden(hide_me);
+        }
+        Hint(BbSettings::MenuText("Your friends see you offline and get no notice when you come online.",
+                                  "Друзья видят вас не в сети и не получают уведомлений."));
+        Checkbox(BbSettings::MenuText("Don't show notifications", "Не показывать уведомления"), s.friends_no_notices);
+        Hint(BbSettings::MenuText("No friend notices (requests, invitations, friends online). This tab still shows "
+                                  "them.",
+                                  "Без уведомлений от друзей (запросы, приглашения, друзья в сети). Эта вкладка "
+                                  "их по-прежнему показывает."));
+    }
+
 }
 
 void Menu() {
@@ -1522,7 +1551,8 @@ void Menu() {
 
     bool restart =
         s.object_motion != s.startup_object_motion || s.model_lod != s.startup_model_lod ||
-        s.live_resolution != s.startup_live_resolution || BbSettings::ResolutionNeedsRestart();
+        s.live_resolution != s.startup_live_resolution ||
+        BbSettings::ResolutionNeedsRestart();
     for (int e = 0; e < BbSettings::EffectCount; ++e) {
         restart |= s.effects[e] != s.startup_effects[e];
     }
@@ -1980,6 +2010,12 @@ void Init(const Vulkan::Instance& instance, vk::Format format, u32 image_count) 
 }
 
 void UpdateTextInput(SDL_Window* window) {
+    if (open_request.exchange(false)) {
+        std::scoped_lock lock{imgui_mutex};
+        if (initialized) {
+            SetOpen(true);
+        }
+    }
     bool want = false;
     {
         std::scoped_lock lock{imgui_mutex};
@@ -2120,6 +2156,16 @@ void Notify(const std::string& title, const std::string& name, const std::string
     }
 }
 
+void OpenMenu() {
+    open_request = true;
+}
+
+void QuitGame() {
+    SDL_Event quit{};
+    quit.type = SDL_EVENT_QUIT;
+    SDL_PushEvent(&quit);
+}
+
 bool MenuOpen() {
     return menu_open;
 }
@@ -2148,6 +2194,7 @@ void Render(vk::CommandBuffer cmdbuf, vk::ImageView view, vk::Extent2D extent) {
     if (ms > 0.0f && ms < 1000.0f) {
         frame_ms_avg = frame_ms_avg == 0.0f ? ms : frame_ms_avg * 0.95f + ms * 0.05f;
     }
+    BbPerf::Frame(ms); // the performance diagnostic (bbport_perf.h)
     if (!Visible()) {
         return;
     }
