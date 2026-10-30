@@ -16,23 +16,34 @@ from patches import load_segments
 
 ENTRY = 'temporary/octane/data/ps4/output/ui/octane_lobby_modeselect.igz'
 LABEL_ENTRY = 'temporary/octane/data/ps4/output/ui/octane_lobby_modeselect_en.lng'
-GRAPH_SHA256 = '56d613eaa1234151a3d720af694b460480c4cbc766508cb60c324c91ca8eae47'
+GRAPH_SHA256 = {
+    '56d613eaa1234151a3d720af694b460480c4cbc766508cb60c324c91ca8eae47',  # USA 1.21
+    'cdb4b366079458a0f1ed32fb8a8ac69d2d841f18bacb9a72430a02e93fcf52a2',  # EU 1.21
+    # The same asset after a 21:9 or 32:9 layout (widescreen.py): the patched_sha256 of
+    # scripts/widescreen_data's nitro-mod.json (USA) and eu/assets.json (EU), identical for every
+    # layout of an edition. The layouts change two byte runs away from the option lists rebuild()
+    # edits, so the selector goes on top of their version.
+    'a23cd1ef8903e50161c2d667e59f85a51fdccecdd913a21d54461f5e693966e3',  # USA 1.21, widescreen
+    'e488136a8c56e367e49e07bdfa42bf7d4c88360893ef135a7ee83eb1e0afa5fc',  # EU 1.21, widescreen
+}
 # Native selector's selected-index event adapter, including its RIP-relative LEA.
 HOOK_PATTERN = re.compile(bytes.fromhex(
-    '55 48 89 e5 41 57 41 56 53 50 48 8d 05 97 a1 87 01'), re.DOTALL)
+    '55 48 89 e5 41 57 41 56 53 50 48 8d 05') + b'[\x97\xa7]' +
+    bytes.fromhex('a1 87 01'), re.DOTALL)
 
 
 def hook_site(elf):
     hits = [v + m.start() for v, off, size in load_segments(elf)
-            for m in HOOK_PATTERN.finditer(elf[off:off + size])]
-    if hits != [0x1277e00]:
+            for m in HOOK_PATTERN.finditer(elf[off:off + size])
+            if v + m.start() + 17 + struct.unpack_from('<i', m.group(), 13)[0] == 0x2af1fa8]
+    if len(hits) != 1 or hits[0] not in (0x1277e00, 0x1277df0):
         raise ValueError('native Online selector adapter is not uniquely recognized')
     return hits[0]
 
 
 def rebuild(blob):
-    if hashlib.sha256(blob).hexdigest() != GRAPH_SHA256:
-        raise ValueError('native Online mode selector is not the supported USA 1.21 asset')
+    if hashlib.sha256(blob).hexdigest() not in GRAPH_SHA256:
+        raise ValueError('native Online mode selector is not the supported USA/EU 1.21 asset')
     g = Igz(blob)
     # The native selector consumes the same option/availability lists as other selectors.
     for lst, raw, tag in (
@@ -53,6 +64,23 @@ def rebuild(blob):
     return g.build()
 
 
+def current_entry(pak, entries, index, base):
+    """The entry's bytes as the game reads them now: base's own replacement (a widescreen layout's
+    menu/HUD fix, kept uncompressed) when it already has one for this entry, else the archive's
+    own (decompressed as the game would)."""
+    if base is not None:
+        _size, _guest, ranges = archive_patch.read(base)
+        count = len(entries)
+        record_at = 0x38 + 4 * count + 16 * index
+        record = next((d for o, d in ranges if o == record_at), None)
+        if record is not None:
+            offset_lo, hi_extra, length, _mode = struct.unpack('<4I', record)
+            position = offset_lo | ((hi_extra & 0xFF) << 32)
+            return archive_patch.view(pak, base, position, length)
+    with pak.open('rb') as f:
+        return iga.read_entry(f, *entries[index][1:])
+
+
 def prepare(game, out, elf, bases):
     site = hook_site(Path(elf).read_bytes())
     pak = resolve(Path(game) / 'archives/update2.pak')
@@ -60,14 +88,14 @@ def prepare(game, out, elf, bases):
     index = next((i for i, e in enumerate(entries) if e[0].lower() == ENTRY), None)
     if index is None:
         raise ValueError('native Online menu graph is missing')
-    with pak.open('rb') as f:
-        payload = rebuild(iga.read_entry(f, *entries[index][1:]))
     out = Path(out)
     out.mkdir(parents=True, exist_ok=True)
     guest = '/app0/archives/update2.pak'
     patches = {archive_patch.read(p)[1]: Path(p) for p in bases}
+    base = patches.get(guest)
+    payload = rebuild(current_entry(pak, entries, index, base))
     target = out / 'online-mode.bbpatch'
-    archive_patch.write_entries_patch(target, pak, guest, {index: payload}, patches.get(guest))
+    archive_patch.write_entries_patch(target, pak, guest, {index: payload}, base, override={index})
     patches[guest] = target
     label_pak = resolve(Path(game) / 'archives/update.pak')
     label_entries = iga.pak_entries(label_pak)

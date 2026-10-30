@@ -776,10 +776,10 @@ def main():
     mod_file_paths.configure(env)
     # The Options menu's Graphics tab and the main menu's Quit Game (scripts/graphics_tab.py): an
     # extra archive of relabelled menus, served by the runtime as archives/update3.pak (no copy of
-    # the game folder). USA 1.21 only: the engine hooks are that executable's
+    # the game folder). USA/EU 1.21: the engine validates the region's hooks
     # (gpu/shim/bbport_graphics_tab.cpp), and without them the runtime leaves the menus alone.
     env.pop('BB_GRAPHICS_TAB_ARCHIVE', None)
-    if (title_id, app_version) == ('CUSA13795', '01.21'):
+    if title_id in ('CUSA13795', 'CUSA14876') and app_version == '01.21':
         result = run_python('scripts/graphics_tab.py', game, '--out', out, '--settings', config,
                             capture=True, check=False)
         for line in result.stdout.splitlines():
@@ -875,15 +875,22 @@ def main():
             env.pop('BB_PRIVATE_ARCHIVE_PATCHES', None)
             env.pop('BB_ONLINE_MODE_HOOK', None)
             if env.get('BB_ONLINE') == '1' or env.get('BB_SPEED_SOLO_TEST') == '1':
-                if title_id == 'CUSA13795':
+                if title_id in ('CUSA13795', 'CUSA14876') and app_version == '01.21':
                     base = [Path(p) for p in archives.split('|') if p]
                     if env.get('BB_ONLINE') == '1':
                         base, env['BB_ONLINE_MODE_HOOK'] = online_mode.prepare(
                             game, out / 'online-mode', out / 'eboot.elf', base)
-                    normal_patches, speed_patches, track_count = speed_mode.prepare(game, out / 'speed-mode', base)
-                    archives = '|'.join(map(str, normal_patches))
-                    env['BB_PRIVATE_ARCHIVE_PATCHES'] = '|'.join(map(str, speed_patches))
-                    say(f'Speed Mode (Experimental): {track_count} tracks prepared for private rooms')
+                    try:
+                        normal_patches, speed_patches, track_count = speed_mode.prepare(
+                            game, out / 'speed-mode', base)
+                    except (ValueError, OSError, KeyError, IndexError) as error:
+                        # a damaged game file stops Speed Mode only: online plays as before
+                        say(f'Speed Mode (Experimental) not available: {error}')
+                        archives = '|'.join(map(str, base))
+                    else:
+                        archives = '|'.join(map(str, normal_patches))
+                        env['BB_PRIVATE_ARCHIVE_PATCHES'] = '|'.join(map(str, speed_patches))
+                        say(f'Speed Mode (Experimental): {track_count} tracks prepared for private rooms')
             if archives:
                 env['BB_ARCHIVE_PATCHES'] = archives
             else:
@@ -922,7 +929,7 @@ def main():
         # Anything that stops it starts the game with shadPS4's Vulkan, as before.
         if (ini_value(config, 'renderer') or 'shadps4') == 'native' and 'BB_NATIVE_VK' not in env:
             if not native_shaders.supported(title_id, app_version):
-                say(f'Native Vulkan: only the USA 1.21 game (CUSA13795) for now; this is {title_id} '
+                say(f'Native Vulkan: only the USA or EU 1.21 game (CUSA13795, CUSA14876) for now; this is {title_id} '
                     f'{app_version}, so the game starts with Vulkan (shadPS4)')
             else:
                 shaders = native_shaders.shader_dir(data, title_id, app_version)
