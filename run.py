@@ -43,7 +43,7 @@ import item_rules  # noqa: E402
 import online_mode  # noqa: E402
 import perf_report  # noqa: E402
 import native_shaders  # noqa: E402
-import widescreen  # noqa: E402
+import aspect_ratio  # noqa: E402
 sys.path.pop(0)
 
 LOG = None  # last_run.log (or BB_SAVE_LOG's file): everything this launch prints
@@ -61,6 +61,17 @@ def fail(message, code=1):
         LOG.write(message + '\n')
         LOG.flush()
     sys.exit(code)
+
+
+def blocked(exe, error):
+    """Windows refused to start the game (WinError 5): an antivirus or Smart App Control blocked
+    or quarantined it, usually right after an update replaced it with a new build."""
+    fail(f'Windows did not let {exe.name} start ({error.strerror or error}). An antivirus or Smart App '
+         f'Control blocked it, or moved it to quarantine. Restore it from the quarantine if needed, add '
+         f'the game folder ({exe.parent.parent}) as an exclusion, and start the game again.\n'
+         f'Windows no dejó iniciar {exe.name}. Un antivirus o el Control inteligente de aplicaciones lo '
+         f'bloqueó o lo puso en cuarentena. Restáuralo si hace falta, agrega la carpeta del juego como '
+         f'exclusión y vuelve a iniciar el juego.')
 
 
 def wait_for(pid):
@@ -611,9 +622,10 @@ def finish_perf_report(env, config, data, version, title_id, code):
             'online': env.get('BB_ONLINE') == '1',
             'settings': perf_report.settings_of(config),
             'exit': {'code': code, 'meaning': perf_report.exit_meaning(code)},
+            'mods': perf_report.mods_in_use(data),
         })
-        if not report.get('overall'):
-            return  # nothing was drawn (a start that stopped early): nothing to say
+        if not report.get('overall') and not report.get('fault'):
+            return  # nothing drawn and no crash (a start stopped early): nothing to say
         path = perf_report.keep(report, data / 'perf')
         if perf_report.consent(config) != '1':
             return
@@ -710,8 +722,11 @@ def main():
             env['PATH'] = f'{clang64}{os.pathsep}{env.get("PATH", "")}'
     # Instruction sets this CPU lacks (MOVBE, BMI1, LZCNT): the ISA rewrite covers them; exit 20
     # is a set nothing covers.
-    features = subprocess.run([str(probe), '--cpu-features'], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                              text=True, creationflags=no_console())
+    try:
+        features = subprocess.run([str(probe), '--cpu-features'], stdin=subprocess.DEVNULL,
+                                  stdout=subprocess.PIPE, text=True, creationflags=no_console())
+    except PermissionError as error:
+        blocked(probe, error)
     if features.returncode == 20:
         print(features.stdout, end='', flush=True)
         sys.exit(20)
@@ -847,7 +862,7 @@ def main():
         except (OSError, ValueError, KeyError, TypeError) as error:
             say(f"Item rules: {error}; the game's own odds")
         env.setdefault('BB_NEO', '0')
-        # A 21:9 or 32:9 layout (bbport.ini widescreen_layout, scripts/widescreen.py): the render
+        # The aspect ratio (bbport.ini aspect_ratio, scripts/aspect_ratio.py): the render
         # path and the patches read its settings (the player's, with the ones it was made for),
         # and it adds its archive patches, executable patch and HUD scale. Read again at a restart.
         layout_saved = {}
@@ -860,13 +875,13 @@ def main():
                 else:
                     env[key] = value
             layout_saved.clear()
-            layout = widescreen.prepare(game, out, config, env, title_id, app_version, base_patches)
-            if mod_packages.ACTIVE and widescreen.selection(widescreen.read_ini(config)) and not layout:
-                raise ValueError('The selected mods cannot use this widescreen layout; see the Widescreen message above.')
+            layout = aspect_ratio.prepare(game, out, config, env, title_id, app_version, base_patches)
+            if mod_packages.ACTIVE and aspect_ratio.selection(aspect_ratio.read_ini(config)) and not layout:
+                raise ValueError('The selected mods cannot use this aspect ratio; see the preparation message above.')
             if layout:
                 layout_saved.update({key: env.get(key) for key in layout['env']})
                 env.update(layout['env'])
-            archives = widescreen.archive_list(base_patches, layout)
+            archives = aspect_ratio.archive_list(base_patches, layout)
             if env.get('BB_MOD_ARCHIVE_PLAN'):
                 from mod_overlays import for_launch
                 builtins = {archive_patch.read(p)[1]: Path(p) for p in archives.split('|') if p} if archives else {}
@@ -880,17 +895,20 @@ def main():
                     if env.get('BB_ONLINE') == '1':
                         base, env['BB_ONLINE_MODE_HOOK'] = online_mode.prepare(
                             game, out / 'online-mode', out / 'eboot.elf', base)
+                        env['BB_MOD_FILE_MAP'] = str((out / 'online-mode/cup-files.map').resolve())
+                        env.setdefault('BB_MOD_SOURCE_GAME', str(game))
+                        env['BB_KNOWN_HEROES'] = online_mode.known_heroes(game)
                     try:
                         normal_patches, speed_patches, track_count = speed_mode.prepare(
                             game, out / 'speed-mode', base)
                     except (ValueError, OSError, KeyError, IndexError) as error:
                         # a damaged game file stops Speed Mode only: online plays as before
-                        say(f'Speed Mode (Experimental) not available: {error}')
+                        say(f'ITEMLESS (Experimental) not available: {error}')
                         archives = '|'.join(map(str, base))
                     else:
                         archives = '|'.join(map(str, normal_patches))
                         env['BB_PRIVATE_ARCHIVE_PATCHES'] = '|'.join(map(str, speed_patches))
-                        say(f'Speed Mode (Experimental): {track_count} tracks prepared for private rooms')
+                        say(f'ITEMLESS (Experimental): {track_count} tracks prepared for private rooms')
             if archives:
                 env['BB_ARCHIVE_PATCHES'] = archives
             else:
@@ -1002,8 +1020,11 @@ def main():
             else:
                 env['BB_VBLANK_HZ'] = {'uncap': '480', '90': '90'}.get(fps, '60')
             # No stdin: an inherited pipe (Git Bash, MSYS2) cost the game its console output.
-            process = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                                       stderr=subprocess.STDOUT, creationflags=no_console())
+            try:
+                process = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                           stderr=subprocess.STDOUT, creationflags=no_console())
+            except PermissionError as error:
+                blocked(probe, error)
             reader = threading.Thread(target=pump, args=(process.stdout,), daemon=True)
             VULKAN_START.update(window=0.0, ready=False)
             reader.start()
