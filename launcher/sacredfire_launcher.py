@@ -106,7 +106,7 @@ RENDER_RESOLUTIONS = [("Game default (the PS4 Pro switches decide)", ""),
                       ("4K (3840 x 2160)", "2160")]
 # bbport.ini aspect_ratio / aspect_output: the display shape and its screen sizes.
 # scripts/aspect_ratio.py prepares 16:10; widescreen.py keeps the corrected 21:9/32:9 layouts.
-ASPECT_RATIOS = [("16:9", "16x9"), ("16:10 (experimental)", "16x10"),
+ASPECT_RATIOS = [("16:9", "16x9"), ("16:10", "16x10"),
                  ("21:9 (corrected menus and HUD)", "21x9"),
                  ("32:9 (corrected menus and HUD)", "32x9")]
 ASPECT_OUTPUTS = {"16x10": [("1920 x 1200", "1920x1200"), ("1280 x 800", "1280x800"),
@@ -146,6 +146,8 @@ DEFAULTS = {
     "language": "1",
     "fullscreen": False,
     "present_mode": "Mailbox",
+    "gpu": "",               # the graphics card by name (bb-gpu-capabilities --gpus); "" automatic
+    "gpu_preference": "auto",  # earlier choice by kind: integrated, discrete (used without "gpu")
     "gamepad": "",
     "gamepad_name": "",
     "neo": False,
@@ -307,6 +309,12 @@ def save_ini(values, lines):
 def game_environment(s):
     """Environment for run.sh from the launcher settings."""
     env = dict(os.environ)
+    env.pop("BB_GPU_NAME", None)
+    env.pop("BB_GPU_PREFERENCE", None)
+    if s.get("gpu"):
+        env["BB_GPU_NAME"] = s["gpu"]  # one that is gone falls back to automatic (vk_instance.cpp)
+    elif s.get("gpu_preference") in ("integrated", "discrete"):
+        env["BB_GPU_PREFERENCE"] = s["gpu_preference"]
     env["BB_GAME_DIR"] = str(Path(s["game_dir"]).expanduser())
     if s["user_dir"]:
         env["BB_USER_DIR"] = s["user_dir"]
@@ -346,6 +354,32 @@ def connected_gamepads():
     except (OSError, subprocess.SubprocessError):
         return []
     return [tuple(line.split("\t", 1)) for line in run.stdout.splitlines() if "\t" in line]
+
+
+def connected_gpus():
+    """(name, label) of the GPUs Vulkan sees (bb-gpu-capabilities --gpus: kind, Vulkan version,
+    name), with the driver setup the game gets (bbport_vulkan.py wraps the launcher too)."""
+    tool = PORT_DIR / ("bin" if PACKAGED else "out") / "bb-gpu-capabilities"
+    try:
+        run = subprocess.run([str(tool), "--gpus"], capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return []
+    found = []
+    for line in run.stdout.splitlines():
+        parts = line.strip().split("\t", 2)
+        if len(parts) < 3:
+            continue
+        kind, version, name = parts
+        label = name + {"discrete": tr(" (dedicated)"), "integrated": tr(" (integrated)"),
+                        "cpu": tr(" (software, very slow)")}.get(kind, "")
+        try:
+            major, minor = (int(x) for x in version.split(".")[:2])
+        except ValueError:
+            major, minor = 0, 0
+        if (major, minor) < (1, 3):
+            label += tr(" - Vulkan {}, not enough for the game").format(version)
+        found.append((name, label))
+    return found
 
 
 def connected_displays():
@@ -433,6 +467,7 @@ def write_patch_config(enabled, disabled):
 MOD_PREFIX = "OCTR-Mod-Library.xml/Mod: "
 MOD_EXTENSIONS = (".pak", ".zip", ".xml")
 GAMEBANANA = "https://gamebanana.com/games/26138"  # the game's page, where the community shares mods
+MODDING_DISCORD = "https://discord.gg/434Rx9hq6T"  # the modding community: help making mods
 MOD_GUIDE_URL = "https://github.com/Brony666/OCTR-NitroFueled-PC/blob/main/docs/mod-packaging.html"
 
 
@@ -1229,6 +1264,17 @@ class LauncherWindow(Adw.ApplicationWindow):
         page.add(performance)
 
         screen = Adw.PreferencesGroup(title=tr("Display"))
+        gpus = connected_gpus()
+        gpu_choices = [(tr("Automatic"), "")] + gpus
+        if self.settings.get("gpu") and self.settings["gpu"] not in [n for n, _ in gpus]:
+            gpu_choices.append((tr("{} (not detected)").format(self.settings["gpu"]), self.settings["gpu"]))
+        self.gpu_row = combo_row(
+            tr("Graphics card"),
+            tr("On laptops with two GPUs, choose the dedicated one (NVIDIA or AMD) if the game starts on the "
+               "integrated one. Automatic uses the dedicated GPU when it has Vulkan 1.3. Applied when the game "
+               "starts. If your dedicated GPU is not listed, update its driver."),
+            gpu_choices, self.settings.get("gpu", ""))
+        screen.add(self.gpu_row)
         self.renderer_row = combo_row(
             tr("Graphics engine"),
             tr("Vulkan (shadPS4) is the usual engine. The native one draws the game straight with Vulkan, without "
@@ -1262,7 +1308,7 @@ class LauncherWindow(Adw.ApplicationWindow):
         screen.add(self.render_res_row)
         self.layout_row = combo_row(
             tr("Aspect ratio"),
-            tr("16:10 is experimental and keeps the original menus and HUD. 21:9 and 32:9 include menu and HUD corrections. "
+            tr("16:10 keeps the original menus and aligns the HUD effects. 21:9 and 32:9 include menu and HUD corrections. "
                "USA or Europe 1.21; otherwise the game starts at 16:9. No FSR or DLSS. Requires a restart."),
             ASPECT_RATIOS, self.ini.get("aspect_ratio", self.ini.get("widescreen_layout", "16x9")))
         screen.add(self.layout_row)
@@ -1573,6 +1619,8 @@ class LauncherWindow(Adw.ApplicationWindow):
         s["neo"] = self.neo_row.get_active()
         s["fullscreen"] = self.fullscreen_row.get_active()
         s["present_mode"] = combo_value(self.present_row)
+        s["gpu"] = combo_value(self.gpu_row)
+        s["gpu_preference"] = "auto"
         s["mangohud"] = self.mangohud_row.get_active()
         s["frame_stats"] = self.stats_row.get_active()
         s["save_log"] = self.save_log_row.get_active()
@@ -2006,7 +2054,9 @@ class LauncherWindow(Adw.ApplicationWindow):
         add_files.add_suffix(folder_button)
         intro.add(add_files)
         self.mods_controls = [add_button, folder_button]
-        for title, url in ((tr("Find mods on GameBanana"), GAMEBANANA), (tr("Read the packaging guide"), None)):
+        for title, url in ((tr("Find mods on GameBanana"), GAMEBANANA),
+                           (tr("Modding Discord (help making mods)"), MODDING_DISCORD),
+                           (tr("Read the packaging guide"), None)):
             row = Adw.ActionRow(title=title, activatable=True)
             row.add_suffix(Gtk.Image(icon_name="web-browser-symbolic" if url else "help-about-symbolic"))
             row.connect("activated", lambda _r, url=url: self.open_mod_link(url))

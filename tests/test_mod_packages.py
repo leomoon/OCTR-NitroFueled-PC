@@ -264,6 +264,19 @@ class PackageTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError,'unverified executable write'):
             adapter.preflight(profile,self.ini,self.prefs)
 
+    def test_preflight_starts_without_a_game_patch_this_build_lacks(self):
+        from test_prepare import fixture
+        profile=self.root/'profile';(profile/'game').mkdir(parents=True);(profile/'patches').mkdir()
+        (profile/'game/eboot.bin').write_bytes(fixture())
+        # The 6.72+ build without the 60 FPS patch's code: the patch is skipped, the mods start.
+        (profile/'patches/CrashTeamRacing.xml').write_text('<Patch><TitleID><ID>CUSA13795</ID></TitleID><Metadata Name="60 FPS Unlock" AppVer="01.21" AppElf="eboot.bin"><PatchList><Line Type="bytes" Address="0x400002" Value="90" Signature="ee ee ee ee" /></PatchList></Metadata></Patch>')
+        self.ini.write_text(self.ini.read_text()+'patch_60fps=1\n')
+        self.assertEqual(adapter.preflight(profile,self.ini,self.prefs),0)
+        # A mod's own write still has to apply.
+        (profile/'patches/OCTR-Mod-Content.xml').write_text('<Patch><Metadata Name="moved" AppVer="01.21" isEnabled="true"><PatchList><Line Type="bytes" Address="0x400002" Value="90" Signature="ee ee ee ee" /></PatchList></Metadata></Patch>')
+        with self.assertRaises(ValueError):
+            adapter.preflight(profile,self.ini,self.prefs)
+
     def test_preflight_expected_code_accepts_unrelated_self_changes(self):
         from test_prepare import fixture
         profile=self.root/'profile';(profile/'game').mkdir(parents=True);(profile/'patches').mkdir()
@@ -293,12 +306,59 @@ class PackageTests(unittest.TestCase):
             self.package(ident,m,{'payload.txt':b'x'})
         self.enable('one','two')
         with self.assertRaisesRegex(ValueError,'Mod conflicts'):self.prepare()
-    def test_save_progress_only_commits_to_private_profile_after_success(self):
+    def test_two_racer_mods_get_one_registration(self):
+        # Each racer mod's update archive carries the whole registration; the session serves one
+        # with both racers, in the higher archive (racer_registry.py; its own tests cover the merge).
+        import racer_registry as rr
+        from test_racer_registry import GAME,MIKU,OLD_MIKU,GWEN,registration,skins
+        from graphics_tab import write_archive
+        class Template:flags=1
+        def pak(entries):
+            path=self.root/'pak.tmp'
+            write_archive(path,[(rr.PREFIX+p,p,i<<8,d) for i,(p,d) in enumerate(entries.items())],Template)
+            return path.read_bytes()
+        (self.game/'archives').mkdir();(self.game/'archives/update2.pak').write_bytes(pak(registration(GAME)))
+        for ident,number,racers in (('miku',4,GAME+[MIKU]),('gwen',5,GAME+[OLD_MIKU,GWEN])):
+            data=pak(registration(racers));extra=b'racer'
+            m=self.manifest(ident)|{'requiresCapabilities':['game-files'],'operations':[
+                {'kind':'game_file','target':'archives/update%d.pak'%number,'original_sha256':None,'patched_sha256':sha_bytes(data),'payload':'update.pak'},
+                {'kind':'game_file','target':'archives/driver%s.pak'%ident,'original_sha256':None,'patched_sha256':sha_bytes(extra),'payload':'racer.pak'}]}
+            self.package(ident,m,{'update.pak':data,'racer.pak':extra})
+        self.enable('miku','gwen');self.prepare()
+        import mod_file_paths
+        with patch.object(mod_file_paths,'_settings',self.environment):
+            merged=rr.read_archive(mod_file_paths.resolve(self.game/'archives/update5.pak'))
+            first=rr.read_archive(mod_file_paths.resolve(self.game/'archives/update4.pak'))
+        self.assertEqual(rr.driver_names(merged[rr.SYSTEM]),['DriverCrash','DriverCoco','DriverMiku','DriverGwen'])
+        self.assertEqual(skins(merged,'DriverMiku'),['Miku','Miku Project Diva'])
+        self.assertEqual(rr.driver_names(first[rr.SYSTEM]),['DriverCrash','DriverCoco','DriverMiku'])
+    def test_mod_session_plays_on_the_players_own_save(self):
+        """Saves and trophies go to the player's user/ (BB_PROGRESS_DIR), with or without mods."""
         self.package();self.enable('sample');self.prepare();session,state=adapter.ACTIVE
-        save=session/'user/savedata/progress';save.parent.mkdir(parents=True);save.write_bytes(b'progress')
-        adapter.finish(1);self.assertFalse((state/'user/savedata/progress').exists())
-        adapter.finish(0);self.assertEqual((state/'user/savedata/progress').read_bytes(),b'progress')
-        self.assertFalse((self.port/'user').exists())
+        self.assertEqual(Path(self.environment['BB_PROGRESS_DIR']),(self.port/'user').resolve())
+        self.assertEqual(Path(self.environment['BB_USER_DIR']),session/'user')
+        self.assertFalse((session/'user/savedata').exists());self.assertFalse((state/'user').exists())
+        adapter.finish(1);self.assertTrue((session/'result.json').exists())
+    def test_old_mod_save_profile_merged_once(self):
+        import time
+        main=self.port/'user/savedata/1/CUSA13795/savedata0/save';main.parent.mkdir(parents=True);main.write_bytes(b'main')
+        old=self.port/'mod-state/user/savedata/1/CUSA13795/savedata0/save';old.parent.mkdir(parents=True);old.write_bytes(b'mods')
+        later=time.time()+60;os.utime(old,(later,later))
+        self.package();self.enable('sample');self.prepare()
+        self.assertEqual(main.read_bytes(),b'mods')  # the newer one, made with mods
+        backups=self.port/'mod-state/save-backups'
+        kept=[p.read_bytes() for p in backups.rglob('save')]
+        self.assertIn(b'main',kept);self.assertIn(b'mods',kept)
+        self.assertFalse((self.port/'mod-state/user').exists())
+        main.write_bytes(b'newer main');self.prepare()  # once: nothing left to merge
+        self.assertEqual(main.read_bytes(),b'newer main')
+    def test_old_mod_save_profile_older_than_main_kept_aside(self):
+        main=self.port/'user/savedata/1/save';main.parent.mkdir(parents=True);main.write_bytes(b'main')
+        old=self.port/'mod-state/user/savedata/1/save';old.parent.mkdir(parents=True);old.write_bytes(b'mods')
+        os.utime(old,(1,1))
+        self.package();self.enable('sample');self.prepare()
+        self.assertEqual(main.read_bytes(),b'main')
+        self.assertIn(b'mods',[p.read_bytes() for p in (self.port/'mod-state/save-backups').rglob('save')])
     def test_compatible_resolution_preserved(self):
         m={'variantSettings':{'output_res':{'default':'5120x1440','allowed':['5120x1440','3840x1080']}}}
         settings,changes=choose([m],{'output_res':'3840x1080'})

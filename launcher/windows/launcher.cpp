@@ -193,6 +193,7 @@ std::string DetectWindowsLocale() {
     if (locale.rfind(L"ja", 0) == 0) return "ja";
     if (locale.rfind(L"zh", 0) == 0) return "zh_CN";
     if (locale.rfind(L"ru", 0) == 0) return "ru";
+    if (locale.rfind(L"id", 0) == 0) return "id";
     return "en";
 }
 
@@ -717,6 +718,8 @@ struct App {
     // Monitors and controllers (bb-gpu-capabilities).
     std::vector<std::pair<std::string, std::string>> displays;  // value (number), label
     std::vector<std::pair<std::string, std::string>> gamepads;  // GUID, name
+    struct Gpu { std::string kind, vulkan, name; };              // bb-gpu-capabilities --gpus
+    std::vector<Gpu> gpus;
     std::thread probe;
     std::atomic<bool> probe_done{false};
 
@@ -1604,6 +1607,7 @@ void StartGame() {
     SetEnv(L"BB_NEO", EffectiveRenderRes() != "1080" ? "1" : "0");  // the resolution picks the path
     SetEnv(L"BB_LANGUAGE", GameLanguage());
     SetEnv(L"BB_DISPLAY", a.launcher.Get("display"));
+    SetEnv(L"BB_GPU_NAME", a.launcher.Get("gpu"));  // the graphics card, by name (empty: automatic)
     SetEnv(L"BB_PRESENT_MODE", a.launcher.Get("present_mode", "Mailbox"));
     SetEnv(L"BB_GAMEPAD", a.launcher.Get("gamepad"));
     SetEnv(L"BB_MENU_LANGUAGE", g_spanish ? "es" : "en");  // the in-game menu follows the launcher
@@ -2049,9 +2053,20 @@ void StartProbe() {
             const auto t = line.find('\t');
             if (t != std::string::npos) pads.emplace_back(line.substr(0, t), line.substr(t + 1));
         }
+        std::vector<App::Gpu> gpus;
+        const Captured g = RunCaptured(tool.wstring(), Quote(tool.wstring()) + L" --gpus", app.bin, 10000);
+        std::stringstream gs(g.output);
+        while (std::getline(gs, line)) {
+            line = Trim(line);
+            const auto t1 = line.find('\t');
+            const auto t2 = t1 == std::string::npos ? t1 : line.find('\t', t1 + 1);
+            if (t2 == std::string::npos) continue;
+            gpus.push_back({line.substr(0, t1), line.substr(t1 + 1, t2 - t1 - 1), line.substr(t2 + 1)});
+        }
         std::scoped_lock lock{app.mutex};
         app.displays = std::move(displays);
         app.gamepads = std::move(pads);
+        app.gpus = std::move(gpus);
         app.probe_done = true;
     });
 }
@@ -2531,6 +2546,25 @@ bool CreateDesktopShortcut(std::string& out_error);
 bool AddToSteam(std::string& out_msg);
 void DrawMenuIcon(ImDrawList* d, int id, ImVec2 c, ImU32 ink, float s);
 
+/// "Add to Steam" and its confirmation (Steam is closed first), on the Play tab and in Settings.
+void SteamButton() {
+    auto& a = g_app;
+    if (ImGui::Button(T("Añadir a Steam", "Add to Steam"))) ImGui::OpenPopup("steam_add");
+    if (ImGui::BeginPopupModal("steam_add", nullptr, ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoTitleBar)) {
+        ImGui::TextUnformatted(T("Si Steam está abierto, se cerrará para añadir el juego (vuelve a abrirlo después).",
+                                 "If Steam is open, it will be closed to add the game (open it again afterwards)."));
+        if (ImGui::Button(T("Añadir", "Add"))) {
+            std::string message;
+            AddToSteam(message);
+            a.notice = message;
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button(T("Cancelar", "Cancel"))) ImGui::CloseCurrentPopup();
+        ImGui::EndPopup();
+    }
+}
+
 bool PrimaryPlayButton(const char* label, ImVec2 size, bool disabled) {
     const bool pressed = ImGui::InvisibleButton("##primary_play", size);
     const ImVec2 a = ImGui::GetItemRectMin();
@@ -2735,6 +2769,8 @@ void PlayTab() {
                 a.notice = err;
             }
         }
+        ImGui::SameLine();
+        SteamButton();
     }
 
     std::string status;
@@ -2812,7 +2848,7 @@ std::string GameTemporal() {
 }
 
 /// v0.7.4: FSR 4's model files (the fsr4_shaders folder next to the launcher, where sacredfire.exe
-/// looks for them); without them the launcher does not offer it.
+/// looks for them; not included). Without them FSR 4 is still listed, and the game uses FSR 3.
 bool Fsr4FilesPresent() {
     static const bool present = [] {
         std::error_code ec;
@@ -2872,11 +2908,77 @@ void RenderResCombo() {
 
 // Aspect ratio is independent of the corrected widescreen layouts: 16:10 prepares the
 // display/camera in scripts/aspect_ratio.py; 21:9/32:9 keep tcosi's menus and HUD.
+/// Windows' own graphics preference for the game (Settings > Display > Graphics), so a laptop's
+/// switchable graphics runs it on the chosen GPU: 2 high performance, 1 power saving, 0 removes
+/// the launcher's entry (Windows decides again).
+void SetWindowsGpuPreference(int preference) {
+    const std::wstring exe = (g_app.bin / L"sacredfire.exe").wstring();
+    HKEY key = nullptr;
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, L"Software\\Microsoft\\DirectX\\UserGpuPreferences", 0, nullptr, 0,
+                        KEY_SET_VALUE, nullptr, &key, nullptr) != ERROR_SUCCESS)
+        return;
+    if (preference) {
+        const std::wstring value = L"GpuPreference=" + std::to_wstring(preference) + L";";
+        RegSetValueExW(key, exe.c_str(), 0, REG_SZ, reinterpret_cast<const BYTE*>(value.c_str()),
+                       DWORD((value.size() + 1) * sizeof(wchar_t)));
+    } else {
+        RegDeleteValueW(key, exe.c_str());
+    }
+    RegCloseKey(key);
+}
+
+std::string GpuLabel(const App::Gpu& gpu) {
+    std::string label = gpu.name;
+    if (gpu.kind == "discrete") label += T(" (dedicada)", " (dedicated)");
+    else if (gpu.kind == "integrated") label += T(" (integrada)", " (integrated)");
+    else if (gpu.kind == "cpu") label += T(" (por software, muy lenta)", " (software, very slow)");
+    const auto dot = gpu.vulkan.find('.');
+    const int major = std::atoi(gpu.vulkan.c_str()), minor = dot == std::string::npos ? 0 : std::atoi(gpu.vulkan.c_str() + dot + 1);
+    if (major < 1 || (major == 1 && minor < 3))
+        label += std::string(T(" - Vulkan ", " - Vulkan ")) + gpu.vulkan + T(", no sirve para el juego", ", not enough for the game");
+    return label;
+}
+
+/// The graphics card: automatic (the engine prefers a dedicated GPU with Vulkan 1.3) or one of
+/// the GPUs Vulkan sees, by name (BB_GPU_NAME; one that is gone falls back to automatic).
+void GpuCombo() {
+    App& a = g_app;
+    std::scoped_lock lock{a.mutex};
+    const std::string current = a.launcher.Get("gpu");
+    std::string preview = T("Automática", "Automatic");
+    bool listed = false;
+    for (const auto& gpu : a.gpus)
+        if (gpu.name == current) { preview = GpuLabel(gpu); listed = true; }
+    if (!current.empty() && !listed) preview = current + T(" (no detectada)", " (not detected)");
+    ImGui::SetNextItemWidth(ImGui::GetFontSize() * 22.0f);
+    if (ImGui::BeginCombo(T("Tarjeta gráfica", "Graphics card"), preview.c_str())) {
+        if (ImGui::Selectable(T("Automática", "Automatic"), current.empty())) {
+            a.launcher.Set("gpu", "");
+            SaveLauncher();
+            SetWindowsGpuPreference(0);
+        }
+        for (const auto& gpu : a.gpus) {
+            if (ImGui::Selectable(GpuLabel(gpu).c_str(), gpu.name == current)) {
+                a.launcher.Set("gpu", gpu.name);
+                SaveLauncher();
+                SetWindowsGpuPreference(gpu.kind == "discrete" ? 2 : gpu.kind == "integrated" ? 1 : 0);
+            }
+        }
+        ImGui::EndCombo();
+    }
+    HelpMarker(T("En notebooks con dos GPU, elige la dedicada (NVIDIA o AMD) si el juego arranca con la integrada. "
+                 "Automática usa la dedicada cuando tiene Vulkan 1.3. Se aplica al iniciar el juego. Si no ves tu "
+                 "GPU dedicada en la lista, actualiza su driver.",
+                 "On laptops with two GPUs, choose the dedicated one (NVIDIA or AMD) if the game starts on the "
+                 "integrated one. Automatic uses the dedicated GPU when it has Vulkan 1.3. Applied when the game "
+                 "starts. If your dedicated GPU is not listed, update its driver."));
+}
+
 void AspectRatioSettings() {
     App& a = g_app;
     std::string mode = a.game.Get("aspect_ratio", a.game.Get("widescreen_layout", "16x9"));
     static constexpr Choice ratios[] = {{"16:9", "16:9", "16x9"},
-                                        {"16:10 (experimental)", "16:10 (experimental)", "16x10"},
+                                        {"16:10", "16:10", "16x10"},
                                         {"21:9", "21:9", "21x9"}, {"32:9", "32:9", "32x9"}};
     if (mode != "16x10" && mode != "21x9" && mode != "32x9") mode = "16x9";
     const char* preview = "16:9";
@@ -2920,9 +3022,9 @@ void AspectRatioSettings() {
     bool changed;
     if (mode == "16x10") {
         changed = GameChoiceCombo(label, "aspect_output", tall, output.empty() ? "1920x1200" : output.c_str(), 16.0f);
-        ImGui::TextColored(kGrey, "%s", T("16:10 experimental: pantalla y cámara adaptadas; menús y HUD originales. "
+        ImGui::TextColored(kGrey, "%s", T("16:10: pantalla y cámara adaptadas; efectos del HUD alineados. "
             "Actualización 1.21, USA o Europa. Sin FSR ni DLSS. Requiere reiniciar.",
-            "Experimental 16:10 display and camera; original menus and HUD. USA or Europe 1.21. "
+            "16:10 display and camera; aligned HUD effects. USA or Europe 1.21. "
             "No FSR or DLSS. Requires a restart."));
     } else if (mode == "21x9") {
         changed = GameChoiceCombo(label, "aspect_output", wide, output.empty() ? "3440x1440" : output.c_str(), 16.0f);
@@ -3009,12 +3111,8 @@ void SettingsTab() {
                "lines in the sky; on other GPUs it may. Costs some frames on modest GPUs. "
                "Needs a restart."));
     {
-        // temporal=off|fsr1|fsr3|dlss|fsr4 (bbport.ini): one upscaler at a time. FSR 4 only with its
-        // model files (Fsr4FilesPresent).
-        static constexpr Choice kTemporal[] = {{"Desactivado", "Off", "off"},
-                                               {"AMD FSR 1", "AMD FSR 1", "fsr1"},
-                                               {"AMD FSR 3 (experimental)", "AMD FSR 3 (experimental)", "fsr3"},
-                                               {"NVIDIA DLSS (experimental)", "NVIDIA DLSS (experimental)", "dlss"}};
+        // temporal=off|fsr1|fsr3|dlss|fsr4 (bbport.ini): one upscaler at a time. FSR 4 runs with its
+        // model files (Fsr4FilesPresent); without them the line below says what is missing.
         static constexpr Choice kTemporalFsr4[] = {{"Desactivado", "Off", "off"},
                                                    {"AMD FSR 1", "AMD FSR 1", "fsr1"},
                                                    {"AMD FSR 3 (experimental)", "AMD FSR 3 (experimental)", "fsr3"},
@@ -3026,9 +3124,7 @@ void SettingsTab() {
         const bool fsr4 = Fsr4FilesPresent();
         const bool picked = native ? GameChoiceCombo(T("Escalado", "Upscaling"), "temporal", kTemporalNative,
                                                      temporal == "off" ? "off" : "fsr1", 16.0f)
-                            : fsr4 ? GameChoiceCombo(T("Escalado", "Upscaling"), "temporal", kTemporalFsr4,
-                                                     temporal.c_str(), 16.0f)
-                                   : GameChoiceCombo(T("Escalado", "Upscaling"), "temporal", kTemporal,
+                                   : GameChoiceCombo(T("Escalado", "Upscaling"), "temporal", kTemporalFsr4,
                                                      temporal.c_str(), 16.0f);
         if (picked) {
             a.game.Erase("fsr1");
@@ -3039,8 +3135,14 @@ void SettingsTab() {
             ImGui::TextColored(kGrey, "%s", T("FSR 3, FSR 4 y DLSS no funcionan con el motor nativo: se usa FSR 1.",
                                               "FSR 3, FSR 4 and DLSS do not work with the native engine: FSR 1 is used."));
         } else if (temporal == "fsr4" && !fsr4) {
-            ImGui::TextColored(kGrey, "%s", T("Faltan los archivos de FSR 4 (carpeta fsr4_shaders): se usa FSR 3.",
-                                              "FSR 4's files are missing (fsr4_shaders folder): FSR 3 is used."));
+            ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + ImGui::GetFontSize() * 34.0f);
+            ImGui::TextColored(kGrey, "%s", T("FSR 4 necesita sus archivos, que no vienen con el juego: pon la carpeta "
+                                              "fsr4_shaders junto al launcher. Mientras falten, se usa FSR 3. También "
+                                              "necesita una gráfica con soporte INT8.",
+                                              "FSR 4 needs its files, which do not come with the game: put the "
+                                              "fsr4_shaders folder next to the launcher. While they are missing, FSR 3 "
+                                              "is used. It also needs a GPU with INT8 support."));
+            ImGui::PopTextWrapPos();
         }
         HelpMarker(T("FSR 1 agranda una escena más pequeña con bordes más nítidos que el estirado simple del juego. "
                      "FSR 3 y DLSS reconstruyen el detalle a lo largo de varios cuadros con la profundidad y el movimiento "
@@ -3121,6 +3223,7 @@ void SettingsTab() {
             ImGui::EndCombo();
         }
     }
+    GpuCombo();
     ImGui::SetNextItemWidth(ImGui::GetFontSize() * 14.0f);
     ChoiceCombo(T("Presentación", "Presentation"), "present_mode", kPresentModes, "Mailbox");
 
@@ -4084,6 +4187,10 @@ void ModsTab() {
     const char* gamebanana=T("Buscar mods en GameBanana","Find mods on GameBanana");
     ImGui::SetCursorPosX(ImGui::GetCursorPosX()+std::max(0.0f,(ImGui::GetContentRegionAvail().x-ImGui::CalcTextSize(gamebanana).x)*.5f));
     if (ImGui::TextLink(gamebanana)) OpenInShell(L"https://gamebanana.com/games/26138");
+    // The modding community's Discord server: help making and packaging mods.
+    const char* modding=T("Discord de modding (ayuda para crear mods)","Modding Discord (help making mods)");
+    ImGui::SetCursorPosX(ImGui::GetCursorPosX()+std::max(0.0f,(ImGui::GetContentRegionAvail().x-ImGui::CalcTextSize(modding).x)*.5f));
+    if (ImGui::TextLink(modding)) OpenInShell(L"https://discord.gg/434Rx9hq6T");
     ImGui::EndChild(); ImGui::PopStyleVar(2); ImGui::PopStyleColor(2);
     if (a.game_running) ImGui::TextColored(kYellow,"%s",T("Cierra el juego para cambiar mods.","Close the game to change mods."));
     ImGui::PopStyleColor(2);
@@ -4928,7 +5035,7 @@ const char* PollGamepadButton() {
             s_getState = (PFN_LauncherXInputGetState)GetProcAddress(s_xinput, "XInputGetState");
         }
     }
-    if (!s_getState) return nullptr;
+    if (!s_getState || GetForegroundWindow() != g_app.hwnd) return nullptr;  // only while in front
 
     for (DWORD i = 0; i < 4; ++i) {
         LauncherXInputState state{};
@@ -5169,7 +5276,7 @@ struct SteamShortcut {
     std::vector<std::string> tags;
 };
 
-[[maybe_unused]] std::vector<SteamShortcut> ParseShortcuts(const std::vector<uint8_t>& buf) {
+std::vector<SteamShortcut> ParseShortcuts(const std::vector<uint8_t>& buf) {
     std::vector<SteamShortcut> list;
     size_t i = 0;
     auto read_sz = [&]() -> std::string {
@@ -5235,7 +5342,20 @@ struct SteamShortcut {
     return list;
 }
 
-[[maybe_unused]] std::vector<uint8_t> SerializeShortcuts(const std::vector<SteamShortcut>& list) {
+/// The shortcuts a shortcuts.vdf holds, counted from its raw "appname" keys: a file ParseShortcuts
+/// reads differently is left alone rather than rewritten without the player's other games.
+size_t CountShortcuts(const std::vector<uint8_t>& buf) {
+    static constexpr char key[] = "\x01appname";
+    size_t count = 0;
+    for (size_t i = 0; i + sizeof key <= buf.size(); ++i) {
+        size_t k = 0;
+        while (k < sizeof key - 1 && ::tolower(buf[i + k]) == key[k]) ++k;
+        if (k == sizeof key - 1 && buf[i + k] == 0) ++count;
+    }
+    return count;
+}
+
+std::vector<uint8_t> SerializeShortcuts(const std::vector<SteamShortcut>& list) {
     std::vector<uint8_t> out;
     auto write_byte = [&](uint8_t b) { out.push_back(b); };
     auto write_sz = [&](const std::string& s) {
@@ -5288,7 +5408,8 @@ struct SteamShortcut {
         write_byte(8);
         write_byte(8);
     }
-    write_byte(8);
+    write_byte(8);  // the "shortcuts" map
+    write_byte(8);  // the file's root: Steam discards a file without it
     return out;
 }
 
@@ -5400,7 +5521,10 @@ void MigrateOldLauncher() {
     }
 }
 
-[[maybe_unused]] bool AddToSteam(std::string& out_msg) {
+/// Adds the launcher to Steam as a non-Steam game started with --launch (the game directly, no
+/// launcher window: Steam's recording and overlay see the game) with the steamgrid artwork.
+/// Steam is closed first when it runs, as it rewrites shortcuts.vdf on exit.
+bool AddToSteam(std::string& out_msg) {
     App& a = g_app;
     fs::path steam_path = FindSteamPath();
     if (steam_path.empty()) {
@@ -5414,27 +5538,36 @@ void MigrateOldLauncher() {
         return false;
     }
 
-    bool steam_was_running = false;
-    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-    if (snap != INVALID_HANDLE_VALUE) {
-        PROCESSENTRY32W pe{sizeof pe};
-        if (Process32FirstW(snap, &pe)) {
-            do {
-                if (_wcsicmp(pe.szExeFile, L"steam.exe") == 0) {
-                    steam_was_running = true;
-                    break;
-                }
-            } while (Process32NextW(snap, &pe));
+    const auto steam_running = [] {
+        bool running = false;
+        HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if (snap != INVALID_HANDLE_VALUE) {
+            PROCESSENTRY32W pe{sizeof pe};
+            if (Process32FirstW(snap, &pe)) {
+                do {
+                    if (_wcsicmp(pe.szExeFile, L"steam.exe") == 0) {
+                        running = true;
+                        break;
+                    }
+                } while (Process32NextW(snap, &pe));
+            }
+            CloseHandle(snap);
         }
-        CloseHandle(snap);
-    }
-
+        return running;
+    };
+    const bool steam_was_running = steam_running();
     if (steam_was_running) {
+        // Steam writes its own list when it exits: the file is changed only once it is gone.
         fs::path steam_exe = steam_path / L"steam.exe";
-        if (fs::is_regular_file(steam_exe, ec)) {
+        if (fs::is_regular_file(steam_exe, ec))
             RunCaptured(steam_exe.wstring(), Quote(steam_exe.wstring()) + L" -shutdown", steam_path, 4000);
-            Sleep(1500);
+        for (int waited = 0; waited < 300 && steam_running(); ++waited) Sleep(100);
+        if (steam_running()) {
+            out_msg = T("Steam no se cerró a tiempo y no se cambió nada. Ciérralo (menú Steam > Salir) y vuelve a intentarlo.",
+                        "Steam did not close in time and nothing was changed. Quit it (Steam menu > Exit) and try again.");
+            return false;
         }
+        Sleep(500);
     }
 
     fs::path assets_dir;
@@ -5466,7 +5599,7 @@ void MigrateOldLauncher() {
     const std::string id32 = std::to_string(appid);
     const std::string id64 = std::to_string(((uint64_t)appid << 32) | 0x02000000);
 
-    int profiles_updated = 0;
+    int profiles_updated = 0, profiles_skipped = 0;
     for (const auto& entry : fs::directory_iterator(userdata, fs::directory_options::skip_permission_denied, ec)) {
         if (!entry.is_directory()) continue;
         const std::string dirname = entry.path().filename().string();
@@ -5497,10 +5630,18 @@ void MigrateOldLauncher() {
         std::vector<SteamShortcut> shortcuts;
         if (fs::is_regular_file(vdf_path, ec)) {
             std::ifstream f(vdf_path, std::ios::binary);
-            if (f) {
-                std::vector<uint8_t> buf((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
-                shortcuts = ParseShortcuts(buf);
+            if (!f) {
+                ++profiles_skipped;
+                continue;
             }
+            std::vector<uint8_t> buf((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+            shortcuts = ParseShortcuts(buf);
+            if (shortcuts.size() != CountShortcuts(buf)) {
+                ++profiles_skipped;  // not read whole: writing it back would lose the player's other games
+                continue;
+            }
+            // The player's other non-Steam games, as they were, in case anything goes wrong.
+            fs::copy_file(vdf_path, config_dir / L"shortcuts.vdf.octr-backup", fs::copy_options::overwrite_existing, ec);
         }
 
         bool found = false;
@@ -5529,11 +5670,22 @@ void MigrateOldLauncher() {
         }
 
         auto serialized = SerializeShortcuts(shortcuts);
-        std::ofstream out(vdf_path, std::ios::binary | std::ios::trunc);
-        if (out) {
-            out.write(reinterpret_cast<const char*>(serialized.data()), serialized.size());
-            profiles_updated++;
+        const fs::path temp = config_dir / L"shortcuts.vdf.octr-new";
+        {
+            std::ofstream out(temp, std::ios::binary | std::ios::trunc);
+            if (out) out.write(reinterpret_cast<const char*>(serialized.data()), serialized.size());
+            if (!out) {
+                fs::remove(temp, ec);
+                ++profiles_skipped;
+                continue;
+            }
         }
+        if (!MoveFileExW(temp.c_str(), vdf_path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+            fs::remove(temp, ec);
+            ++profiles_skipped;
+            continue;
+        }
+        profiles_updated++;
     }
 
     if (profiles_updated > 0) {
@@ -5545,6 +5697,14 @@ void MigrateOldLauncher() {
                         "Successfully added to Steam with custom artwork!\nOpen Steam to see the game in your library.");
         }
         return true;
+    } else if (profiles_skipped > 0) {
+        out_msg = T("No se pudo añadir a Steam: su lista de juegos no-Steam tiene un formato que el launcher no "
+                    "reconoce, y no se tocó. Añádelo a mano: \"Añadir un juego que no es de Steam\", elige "
+                    "este launcher y escribe --launch en Opciones de lanzamiento.",
+                    "Could not add to Steam: its list of non-Steam games has a format the launcher does not "
+                    "recognize, and it was left untouched. Add it by hand: \"Add a Non-Steam Game\", pick this "
+                    "launcher and write --launch in Launch Options.");
+        return false;
     } else {
         out_msg = T("No se encontró ningún perfil de usuario en Steam.", "No user profiles found in Steam.");
         return false;
@@ -6032,6 +6192,7 @@ bool ReadTrophyTsv(const fs::path& file, const std::string& language, TrophySet&
 void WriteTrophyTsv(const TrophySet& t) {
     std::string out = "#lang\t" + t.language + "\n#title\t" + Sanitize(t.title_name) + "\n";
     for (const auto& tr : t.list)
+        if (tr.id < 100)  // OCTR's own (ctr_trophies.h) are not the game's: the runtime counts these
         out += std::to_string(tr.id) + "\t" + std::string(1, tr.grade ? tr.grade : '?') + "\t" + (tr.hidden ? "1" : "0") + "\t" +
                Sanitize(tr.name) + "\t" + Sanitize(tr.detail) + "\n";
     std::error_code ec;
@@ -6150,6 +6311,17 @@ void LoadTrophies() {
                 t.note = T("La clave de trofeos no descifra este juego: revisa que sea la de tu PS4 (32 cifras hexadecimales).",
                            "The trophy key does not decrypt this game: check it is your PS4's (32 hex digits).");
             }
+        }
+    }
+    // OCTR's own trophies, past the game's (src/ctr_trophies.h; the server gives them).
+    if (!t.list.empty() && (t.title_id == "CUSA13795" || t.title_id == "CUSA14876")) {
+        for (const auto& o : octr_trophies) {
+            Trophy tr;
+            tr.id = o.id;
+            tr.grade = o.grade;
+            tr.name = T(o.name_es, o.name_en);
+            tr.detail = T(o.es, o.en);
+            t.list.push_back(std::move(tr));
         }
     }
     ReadUnlocked(t);
@@ -6499,7 +6671,7 @@ void ToolsTab() {
                  T("Para reportar fallos o tirones: adjunta el archivo de logs\\ en un issue.",
                    "To report crashes or stutter: attach the file from logs\\ to an issue."));
 
-    ImGui::SeparatorText(T("Acceso directo", "Desktop shortcut"));
+    ImGui::SeparatorText(T("Accesos directos", "Shortcuts"));
     if (ImGui::Button(T("Crear acceso directo en el Escritorio", "Create Desktop Shortcut"))) {
         std::string err;
         if (CreateDesktopShortcut(err)) {
@@ -6511,6 +6683,13 @@ void ToolsTab() {
     }
     HelpMarker(T("Crea un acceso directo en tu Escritorio para iniciar directamente el juego con su icono sin abrir la ventana del launcher.",
                  "Creates a shortcut on your Desktop to start the game directly with its icon without the launcher window."));
+    SteamButton();
+    HelpMarker(T("Lo añade a tu biblioteca de Steam como juego no-Steam, con sus portadas. Abre el juego directo, "
+                 "sin la ventana del launcher, así que la grabación y el overlay de Steam ven el juego. Tus "
+                 "ajustes, el online y los mods se mantienen.",
+                 "Adds it to your Steam library as a non-Steam game, with its artwork. It opens the game "
+                 "directly, without the launcher window, so Steam's recording and overlay see the game. Your "
+                 "settings, online and mods still apply."));
 
     ImGui::SeparatorText(T("Caché de shaders", "Shader cache"));
     ImGui::PushTextWrapPos(0.0f);
@@ -6525,11 +6704,12 @@ void ToolsTab() {
 
     ImGui::SeparatorText(T("Idioma del launcher", "Launcher language"));
     const char* language_names[] = {"Auto (Windows)", "English", "Español", "Português (Brasil)", "Français",
-                                    "Deutsch", "Italiano", "日本語", "简体中文", "Русский"};
-    const char* language_codes[] = {"auto", "en", "es", "pt_BR", "fr", "de", "it", "ja", "zh_CN", "ru"};
+                                    "Deutsch", "Italiano", "日本語", "简体中文", "Русский", "Bahasa Indonesia"};
+    const char* language_codes[] = {"auto", "en", "es", "pt_BR", "fr", "de", "it", "ja", "zh_CN", "ru", "id"};
+    constexpr int language_count = int(sizeof language_codes / sizeof *language_codes);
     int selected_language = 0;
-    for (int i = 0; i < 10; ++i) if (g_language == language_codes[i]) selected_language = i;
-    if (ImGui::Combo(T("Idioma", "Language"), &selected_language, language_names, 10)) {
+    for (int i = 0; i < language_count; ++i) if (g_language == language_codes[i]) selected_language = i;
+    if (ImGui::Combo(T("Idioma", "Language"), &selected_language, language_names, language_count)) {
         g_language = language_codes[selected_language];
         ApplyLauncherLanguage();
         SaveLauncher();
@@ -7353,6 +7533,10 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
             g_resize_w = g_resize_h = 0;
             CreateRenderTarget();
         }
+        // The controller drives the launcher only while it is the window in front: XInput is
+        // read whatever window has the focus, so playing moved the launcher's menus too.
+        if (GetForegroundWindow() == hwnd) io.ConfigFlags |= ImGuiConfigFlags_NavEnableGamepad;
+        else io.ConfigFlags &= ~ImGuiConfigFlags_NavEnableGamepad;
         ImGui_ImplDX11_NewFrame();
         ImGui_ImplWin32_NewFrame();
         ImGui::NewFrame();

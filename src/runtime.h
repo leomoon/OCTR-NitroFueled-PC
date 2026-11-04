@@ -96,17 +96,37 @@ void runtime_cinematic_cutscene_fill(void); /* cutscenes get a 16:9 field of vie
 /* SacredFire: ultrawide title and customization screens (runtime_frontend.c). */
 void runtime_frontend_start(const unsigned char *image);
 int runtime_online_mode_start(unsigned char *image, size_t size);
+int runtime_time_trial_start(unsigned char *image, size_t size);
 /* The private room's mode through RyuNET (runtime_room_mode.c): the host publishes its choice,
  * a player who joins takes it, also when joining by invitation (no selector seen). */
 void runtime_online_mode_adopt(int speed);
 void runtime_online_mode_leave_cup(void);
 int runtime_online_mode_private_speed(void);
 int runtime_online_mode_private_cup(void);
+int runtime_online_mode_private_single_options(void);
+int runtime_online_mode_private_teams(void);
 int runtime_online_mode_in_private(void);
+int runtime_online_mode_private_cup_race(void); /* a race of a private room's CUP is loading or running */
 void runtime_room_mode_hosting(void);
 void runtime_room_mode_joined(const char *session_id);
 void runtime_room_mode_left(void);
+int runtime_public_itemless_start(unsigned char *image, size_t size);
+int runtime_public_itemless_available(void);
+int runtime_public_itemless_announce(void);
+int runtime_public_itemless_active(void);
+int runtime_private_match_active(void);
+int runtime_private_party_check(void);
+int runtime_private_difficulty_modified(void);
+int runtime_public_itemless_selected(void);
+void runtime_public_itemless_select(int enabled);
+void runtime_public_itemless_reset(void);
+void runtime_public_itemless_party_ready(void);
+void runtime_public_itemless_update(void);
+int runtime_speed_mode_enabled(void);
 int runtime_speed_race_active(void);
+void runtime_race_options_leave_room(void);
+void runtime_race_options_map_loading(const char *map);
+int runtime_race_options_start(unsigned char *image, size_t size);
 int runtime_itemless_start(unsigned char *image, size_t size);
 /* SacredFire online: the running game's title id for the PSN data (runtime_services.c). */
 void runtime_np_set_title(const char *title_id);
@@ -143,9 +163,12 @@ int runtime_pad_user_present(int user);
 void runtime_services_user_change(int user, int login);
 uintptr_t runtime_rtc_resolve(const char *name);
 const char *runtime_file_user_dir(void);
+const char *runtime_file_progress_dir(void); /* saves and trophies: BB_PROGRESS_DIR or the user folder */
 void runtime_savedata_configure(const char *title);
 /* The game's TITLE_ID: where its trophies are kept (<user>/trophies/<title>/). */
 void runtime_trophy_configure(const char *title);
+void runtime_meta_dump_start(unsigned char *image, size_t size); /* BB_META_DUMP=1: field metadata (lab) */
+void runtime_trophy_badges(const char *json); /* the server's badges: OCTR's trophies (ctr_trophies.h) */
 uintptr_t runtime_savedata_resolve(const char *name);
 void runtime_savedata_report(void);
 void runtime_thread_attach_host(const char *name);

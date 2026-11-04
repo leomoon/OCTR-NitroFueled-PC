@@ -1,11 +1,13 @@
 {
+ "Automatic": "Automática",
+ "Graphics card": "Tarjeta gráfica",
  "\n— the game exited (code {}) —\n": "\n— el juego terminó (código {}) —\n",
  " (default)": " (predeterminado)",
  "(none)": "(ninguno)",
  "100% is the level the game was mixed at. Above it, the loudest peaks are rounded off instead of distorting. While you play it can also be changed in the in-game menu (Insert or L3+R3).": "100% es el nivel al que se mezcló el juego. Por encima, los picos más fuertes se suavizan en vez de distorsionar. Mientras juegas también se cambia en el menú del juego (Insert o L3+R3).",
  "1440p (2560 x 1440, PS4 Pro)": "1440p (2560 x 1440, PS4 Pro)",
- "16:10 (experimental)": "16:10 (experimental)",
- "16:10 is experimental and keeps the original menus and HUD. 21:9 and 32:9 include menu and HUD corrections. USA or Europe 1.21; otherwise the game starts at 16:9. No FSR or DLSS. Requires a restart.": "16:10 es experimental y conserva los menús y HUD originales. 21:9 y 32:9 incluyen correcciones de menús y HUD. USA o Europa 1.21; en otras versiones el juego arranca en 16:9. Sin FSR ni DLSS. Requiere reiniciar.",
+ "16:10": "16:10",
+ "16:10 keeps the original menus and aligns the HUD effects. 21:9 and 32:9 include menu and HUD corrections. USA or Europe 1.21; otherwise the game starts at 16:9. No FSR or DLSS. Requires a restart.": "16:10 conserva los menús originales y alinea los efectos del HUD. 21:9 y 32:9 incluyen correcciones de menús y HUD. USA o Europa 1.21; en otras versiones el juego arranca en 16:9. Sin FSR ni DLSS. Requiere reiniciar.",
  "21:9 (corrected menus and HUD)": "21:9 (menús y HUD corregidos)",
  "32:9 (corrected menus and HUD)": "32:9 (menús y HUD corregidos)",
  "480p (854 x 480, very low-end PCs)": "480p (854 x 480, PCs muy modestos)",
@@ -413,5 +415,12 @@
  "Preparing the programs...": "Preparando los programas...",
  "Translating the shaders...": "Traduciendo los shaders...",
  "Compiling the shaders...": "Compilando los shaders...",
- "Finishing...": "Terminando..."
+ "Finishing...": "Terminando...",
+ " (dedicated)": " (dedicada)",
+ " (integrated)": " (integrada)",
+ " (software, very slow)": " (por software, muy lenta)",
+ " - Vulkan {}, not enough for the game": " - Vulkan {}, no sirve para el juego",
+ "{} (not detected)": "{} (no detectada)",
+ "On laptops with two GPUs, choose the dedicated one (NVIDIA or AMD) if the game starts on the integrated one. Automatic uses the dedicated GPU when it has Vulkan 1.3. Applied when the game starts. If your dedicated GPU is not listed, update its driver.": "En notebooks con dos GPU, elige la dedicada (NVIDIA o AMD) si el juego arranca con la integrada. Automática usa la dedicada cuando tiene Vulkan 1.3. Se aplica al iniciar el juego. Si no ves tu GPU dedicada en la lista, actualiza su driver.",
+ "Modding Discord (help making mods)": "Discord de modding (ayuda para crear mods)"
 }

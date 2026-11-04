@@ -44,6 +44,10 @@ import online_mode  # noqa: E402
 import perf_report  # noqa: E402
 import native_shaders  # noqa: E402
 import aspect_ratio  # noqa: E402
+import patches  # noqa: E402
+import boot_cache  # noqa: E402
+import launch_lock  # noqa: E402
+import ryunet_session  # noqa: E402
 sys.path.pop(0)
 
 LOG = None  # last_run.log (or BB_SAVE_LOG's file): everything this launch prints
@@ -134,11 +138,21 @@ def say(message):
     emit(message + '\n')
 
 
+def startup_call(label, function, *args, **kwargs):
+    if os.environ.get('BB_STARTUP_TIMING') != '1':
+        return function(*args, **kwargs)
+    started = time.perf_counter()
+    try:
+        return function(*args, **kwargs)
+    finally:
+        say(f'Startup: {label} {time.perf_counter() - started:.3f} s')
+
+
 def run_python(script, *args, capture=False, check=True):
     # -X utf8: the embeddable Python of the portable package ignores PYTHONUTF8, and the scripts
     # print the game's title (with its trademark sign) to a pipe.
     command = [sys.executable, '-X', 'utf8', str(PORT / script), *map(str, args)]
-    result = subprocess.run(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+    result = startup_call(script, subprocess.run, command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                             stderr=None if capture else subprocess.STDOUT, text=True,
                             encoding='utf-8', errors='replace', creationflags=no_console())
     if not capture and result.stdout:
@@ -346,7 +360,22 @@ HTTPS_PORT = 443      # the server's nginx: /ryunet/ by HTTPS (tests point it el
 HTTPS_FAILED = set()  # servers whose HTTPS failed this run: their next requests go to the port
 
 
-def ryunet_json(host, port, target, timeout, method='GET', headers=None, body=None):
+def machine_header():
+    """This PC's anonymous fingerprint for the server's bans (scripts/machine_id.py), once."""
+    global MACHINE
+    if MACHINE is None:
+        try:
+            import machine_id
+            MACHINE = machine_id.header()
+        except Exception:  # never stops a launch
+            MACHINE = ''
+    return MACHINE
+
+
+MACHINE = None
+
+
+def ryunet_json(host, port, target, timeout, method='GET', headers=None, body=None, session=None):
     """A request to the RyuNET server and its JSON answer, with the reply (for its Date header).
     By HTTPS on the server's name first (443, where its nginx passes /ryunet/ to the server): a
     filter on the way cannot rewrite it, and networks that only let 80/443 out reach it. Then by
@@ -364,28 +393,31 @@ def ryunet_json(host, port, target, timeout, method='GET', headers=None, body=No
             return None  # the server never redirects: a redirect comes from something on the way
 
     opener = urllib.request.build_opener(NoRedirect)
-    urls = []
-    try:
-        ipaddress.ip_address(host)
-    except ValueError:  # a name: a certificate can vouch for it (never for a bare address)
-        if host not in HTTPS_FAILED:
-            urls.append((f'https://{host}' + (f':{HTTPS_PORT}' if HTTPS_PORT != 443 else '') + target, True))
-    urls.append((f'http://{host}:{port}{target}', False))
-    try:
-        address = socket.gethostbyname(host)
-        if address != host:
-            urls.append((f'http://{address}:{port}{target}', False))
-    except OSError:
-        pass
+    def urls():
+        try:
+            ipaddress.ip_address(host)
+        except ValueError:  # a certificate can vouch for a name, never a bare address
+            if host not in HTTPS_FAILED:
+                yield f'https://{host}' + (f':{HTTPS_PORT}' if HTTPS_PORT != 443 else '') + target, True
+        yield f'http://{host}:{port}{target}', False
+        # Resolve the filter-bypass address only if the named endpoints did not work.
+        try:
+            address = socket.gethostbyname(host)
+            if address != host:
+                yield f'http://{address}:{port}{target}', False
+        except OSError:
+            pass
     failure = OSError(f'{host}: no answer')
-    for url, secure in urls:
+    for url, secure in urls():
         name = url.split('/')[2]
         request = urllib.request.Request(url, method=method,
                                          data=body if body is not None else (b'' if method == 'POST' else None),
                                          headers={**(headers(method, target) if headers else {}),
+                                                  **({'X-RyuNET-Machine': machine_header()} if machine_header() else {}),
                                                   **({'Content-Type': 'application/json'} if body is not None else {})})
         try:
-            with opener.open(request, timeout=timeout) as reply:
+            response = session.open(request, timeout, opener) if session else opener.open(request, timeout=timeout)
+            with response as reply:
                 if 'json' not in (reply.headers.get('Content-Type') or ''):
                     failure = OSError(f'{name}: answered by something on the way, not the server')
                     HTTPS_FAILED.update([host] if secure else [])
@@ -408,18 +440,18 @@ def ryunet_json(host, port, target, timeout, method='GET', headers=None, body=No
     raise failure
 
 
-def claim_nick(host, port, name, khash):
+def claim_nick(host, port, name, khash, session=None):
     """Registers this installation for a free nickname, before the game logs in with it (the
     game's own requests are signed and cannot register). The key's hash crosses the network only
     here, once. Nothing happens when the server cannot be reached or is older."""
     import urllib.parse
     q = urllib.parse.urlencode({'name': name})
     try:
-        status, _ = ryunet_json(host, port, f'/ryunet/nick?{q}', 4,
+        status, _ = ryunet_json(host, port, f'/ryunet/nick?{q}', 4, session=session,
                                 headers=lambda m, t: {'X-RyuNET-Proof': proof_header(khash, m, t)})
         if status.get('status') != 'free':
             return
-        claimed, _ = ryunet_json(host, port, f'/ryunet/nick/claim?{q}', 4, method='POST',
+        claimed, _ = ryunet_json(host, port, f'/ryunet/nick/claim?{q}', 4, method='POST', session=session,
                                  headers=lambda m, t: {'X-RyuNET-Proof': proof_header(khash, m, t),
                                                        'X-RyuNET-Key-Hash': khash})
         say(f'Nickname {name}: {claimed.get("status")} on {host}')
@@ -427,12 +459,12 @@ def claim_nick(host, port, name, khash):
         say(f'Nickname {name}: could not register it on {host} ({error})')
 
 
-def server_settings(host, port):
+def server_settings(host, port, session=None):
     """What the server announces for every player (GET /ryunet/theme): the season theme, which
     scripts/patches.py loads in every level (THEME_VALUES), and the seconds an online race goes on
     after the first player finishes (end_race_patches). {} when it does not answer."""
     try:
-        settings, reply = ryunet_json(host, port, '/ryunet/theme', 3)
+        settings, reply = ryunet_json(host, port, '/ryunet/theme', 3, session=session)
     except (OSError, ValueError):
         return {}
     note_server_clock(reply)
@@ -495,6 +527,7 @@ def setup_online(env, config, data):
 
     # Ignore the retired launcher toggle; the native selector owns this session's mode.
     env.pop('BB_SPEED_MODE', None)
+    env['BB_PUBLIC_ITEMLESS'] = '0'
 
     name = env.get('BB_ONLINE_NAME', ini_values.get('online_name', ini_values.get('user_name', ''))).strip()
     online = env.get('BB_ONLINE', ini_values.get('online', '0'))
@@ -526,20 +559,23 @@ def setup_online(env, config, data):
     env['BB_ONLINE_NAME'] = name
     # The server's announcements (used below); its answer also tells its clock, before anything
     # is signed.
-    announced = server_settings(host, auth_port)
-    if SERVER_CLOCK_OFFSET:
-        env['BB_ONLINE_CLOCK_OFFSET'] = str(SERVER_CLOCK_OFFSET)
-        if abs(SERVER_CLOCK_OFFSET) > 60:
-            minutes = round(abs(SERVER_CLOCK_OFFSET) / 60)
-            say(f"This PC's clock is {minutes} min {'behind' if SERVER_CLOCK_OFFSET > 0 else 'ahead of'} "
-                "the server's: online uses the server's time, but sync it (Windows: Settings > Time > Sync now).")
-    else:
-        env.pop('BB_ONLINE_CLOCK_OFFSET', None)
-    key = online_key(data)
-    env.pop('BB_ONLINE_KEY', None)  # the key is not sent any more: requests are signed with its hash
-    if key:
-        env['BB_ONLINE_KEYHASH'] = key_hash(server_key(key, host))
-        claim_nick(host, auth_port, name, env['BB_ONLINE_KEYHASH'])
+    with ryunet_session.Session() as session:
+        announced = startup_call('online.server_settings', server_settings, host, auth_port, session=session)
+        if announced.get('itemless_matchmaking') == 1:
+            env['BB_PUBLIC_ITEMLESS'] = '1'
+        if SERVER_CLOCK_OFFSET:
+            env['BB_ONLINE_CLOCK_OFFSET'] = str(SERVER_CLOCK_OFFSET)
+            if abs(SERVER_CLOCK_OFFSET) > 60:
+                minutes = round(abs(SERVER_CLOCK_OFFSET) / 60)
+                say(f"This PC's clock is {minutes} min {'behind' if SERVER_CLOCK_OFFSET > 0 else 'ahead of'} "
+                    "the server's: online uses the server's time, but sync it (Windows: Settings > Time > Sync now).")
+        else:
+            env.pop('BB_ONLINE_CLOCK_OFFSET', None)
+        key = online_key(data)
+        env.pop('BB_ONLINE_KEY', None)  # the key is not sent any more: requests are signed with its hash
+        if key:
+            env['BB_ONLINE_KEYHASH'] = key_hash(server_key(key, host))
+            startup_call('online.claim_nick', claim_nick, host, auth_port, name, env['BB_ONLINE_KEYHASH'], session=session)
     # online_inventory=save: keep the Pit Stop items of this save (a "100%" save) online
     # instead of the ones bought on the server, which are tied to the nickname.
     if env.get('BB_ONLINE_INVENTORY', ini_values.get('online_inventory', 'server')).strip().lower() == 'save':
@@ -601,6 +637,12 @@ def setup_online(env, config, data):
     # (scripts/item_rules.py); none: the game's own.
     items = announced.get('items')
     rules_file = data / 'out' / 'item_rules' / 'server.json'
+    # The rules' id (server client_gate.go): the game sends it at login once they are applied
+    # (BB_ITEM_RULES_ID, set where they are); "none": the server has no rules to apply.
+    items_id = announced.get('items_id')
+    env['BB_ITEM_RULES_SERVER_ID'] = items_id if isinstance(items_id, str) and items_id.isalnum() else ''
+    if not (isinstance(items, dict) and items) and env['BB_ITEM_RULES_SERVER_ID']:
+        env['BB_ITEM_RULES_SERVER_ID'] = 'none'
     if isinstance(items, dict) and items:
         rules_file.parent.mkdir(parents=True, exist_ok=True)
         rules_file.write_text(json.dumps(items, sort_keys=True), encoding='utf-8')
@@ -622,7 +664,7 @@ def finish_perf_report(env, config, data, version, title_id, code):
             'online': env.get('BB_ONLINE') == '1',
             'settings': perf_report.settings_of(config),
             'exit': {'code': code, 'meaning': perf_report.exit_meaning(code)},
-            'mods': perf_report.mods_in_use(data),
+            'mods': perf_report.mods_in_use(data, env),
         })
         if not report.get('overall') and not report.get('fault'):
             return  # nothing drawn and no crash (a start stopped early): nothing to say
@@ -684,6 +726,14 @@ def main():
         wait_for(int(args[1]))
         args = args[2:]
     os.chdir(PORT)  # as run.sh: relative paths are from the port
+    try:
+        with launch_lock.session(Path(os.environ.get('BB_DATA_DIR', PORT))):
+            return launch(args, restarted)
+    except (OSError, ValueError, RuntimeError, boot_cache.prepare.GameCheckError) as error:
+        fail('Launch failed: ' + str(error))
+
+
+def launch(args, restarted=False):
     env = os.environ
     data = Path(env.get('BB_DATA_DIR', PORT))
     out = data / 'out'
@@ -768,7 +818,7 @@ def main():
             fail(f'{game} has the PS4 PKG Tool layout (Image0 and Sc0): prepare it in the launcher first.')
         fail(f'No eboot.bin in {game} (set BB_GAME_DIR to your {TITLE_ID} folder).')
     # The game check compares the executable image with the supported one (CTR NF 1.21).
-    check = subprocess.run([sys.executable, '-X', 'utf8', str(PORT / 'scripts' / 'game_check.py'), str(game)],
+    check = startup_call('game_check', subprocess.run, [sys.executable, '-X', 'utf8', str(PORT / 'scripts' / 'game_check.py'), str(game)],
                            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                            text=True, encoding='utf-8', errors='replace', creationflags=no_console())
     if check.returncode:
@@ -783,7 +833,7 @@ def main():
 
     import mod_packages
     try:
-        game, config = mod_packages.prepare(PORT, data, env, game, config,log=say)
+        game, config = startup_call('mod_packages.prepare', mod_packages.prepare, PORT, data, env, game, config,log=say)
     except (ValueError, RuntimeError, OSError) as error:
         fail('Mod launch blocked: ' + str(error) + '\nChoose compatible settings or disable the indicated mod in Mods.')
     original_game = game.resolve()
@@ -810,20 +860,21 @@ def main():
                            '--enabled', env.get('BB_MODS_ENABLED', '1'), capture=True).stdout.strip())
     mod_view = game if game.resolve() != original_game else None
     try:
-        run_python('scripts/prepare.py', game, '--out', out)
-        run_python('scripts/link_libc.py', game, '--out', out)
-        run_python('scripts/link_modules.py', game, '--out', out, '--modules',
-                   'libc.prx', 'libSceFios2.prx', 'libSceNpToolkit2.prx')
+        try:
+            boot = startup_call('boot_cache.ensure', boot_cache.ensure, game, out, log=say)
+        except (StopIteration, KeyError, IndexError) as error:
+            fail('Boot preparation failed: ' + str(error))
         # A failed rewrite prints its reason and the game starts without the table.
         isa_args = []
         if isa_rewrite_wanted(missing, env):
-            result = run_python('scripts/isa_rewrite.py', out / 'boot-linked.bin', '--out', out,
+            isa_out = boot / 'isa'
+            result = run_python('scripts/isa_rewrite.py', boot / 'boot-linked.bin', '--out', isa_out,
                                 capture=True, check=False)
             emit(result.stdout)
             if result.returncode == 0:
-                isa_args = ['--isa-rewrite', str(out / 'isa-rewrite.bin')]
+                isa_args = ['--isa-rewrite', str(isa_out / 'isa-rewrite.bin')]
         # Symbol names for the eboot's host-side imports (shadPS4's aerolib list, fetched once).
-        run_python('tools/gen_import_names.py', '--out', out)
+        run_python('tools/gen_import_names.py', '--out', out, '--boot-dir', boot)
         # DLC (optional): the player's add-on packages in dlc\ (BB_DLC_DIR), reported installed.
         run_python('scripts/content_profile.py', game, '--out', out, '--sku', env.get('BB_CONTENT_SKU', 'full'),
                    '--dlc-dir', env.get('BB_DLC_DIR') or data / 'dlc')  # empty: dlc\, as run.sh
@@ -851,16 +902,9 @@ def main():
         # Xbox button prompts (bbport.ini button_prompts, scripts/button_prompts.py): the fonts'
         # button image through archive patches, each keeping the playlist's for the same archive.
         try:
-            base_patches.update(button_prompts.prepare(game, out, config, env, base_patches))
+            base_patches.update(startup_call('button_prompts.prepare', button_prompts.prepare, game, out, config, env, base_patches))
         except (OSError, ValueError) as error:
             say(f'Button prompts: {error}; PlayStation buttons')
-        # Item-box rules (scripts/item_rules.py): the server's, which setup_online saved.
-        try:
-            rules_path = env.get('BB_ITEM_RULES')
-            rules = json.loads(Path(rules_path).read_text(encoding='utf-8')) if rules_path else None
-            base_patches.update(item_rules.prepare(game, out, rules, base_patches, log=say))
-        except (OSError, ValueError, KeyError, TypeError) as error:
-            say(f"Item rules: {error}; the game's own odds")
         env.setdefault('BB_NEO', '0')
         # The aspect ratio (bbport.ini aspect_ratio, scripts/aspect_ratio.py): the render
         # path and the patches read its settings (the player's, with the ones it was made for),
@@ -875,7 +919,7 @@ def main():
                 else:
                     env[key] = value
             layout_saved.clear()
-            layout = aspect_ratio.prepare(game, out, config, env, title_id, app_version, base_patches)
+            layout = startup_call('aspect_ratio.prepare', aspect_ratio.prepare, game, out, config, env, title_id, app_version, base_patches, boot_dir=boot)
             if mod_packages.ACTIVE and aspect_ratio.selection(aspect_ratio.read_ini(config)) and not layout:
                 raise ValueError('The selected mods cannot use this aspect ratio; see the preparation message above.')
             if layout:
@@ -887,28 +931,51 @@ def main():
                 builtins = {archive_patch.read(p)[1]: Path(p) for p in archives.split('|') if p} if archives else {}
                 composed = for_launch(game, out / 'mod-overlays', env['BB_MOD_ARCHIVE_PLAN'], builtins)
                 archives = '|'.join(str(p) for p in composed.values())
+            # Item-box rules (scripts/item_rules.py): the server's, which setup_online saved, last:
+            # over every systemData.igz copy the game loads, a mod's included.
+            env.pop('BB_ITEM_RULES_ID', None)
+            try:
+                rules_path = env.get('BB_ITEM_RULES')
+                rules = json.loads(Path(rules_path).read_text(encoding='utf-8')) if rules_path else None
+                before = archives
+                archives = startup_call('item_rules.with_rules', item_rules.with_rules, game, out, rules, archives, log=say)
+                server_id = env.get('BB_ITEM_RULES_SERVER_ID', '')
+                if server_id == 'none' or (server_id and rules and archives != before):
+                    env['BB_ITEM_RULES_ID'] = server_id
+            except (OSError, ValueError, KeyError, TypeError) as error:
+                say(f"Item rules: {error}; the game's own odds")
             env.pop('BB_PRIVATE_ARCHIVE_PATCHES', None)
             env.pop('BB_ONLINE_MODE_HOOK', None)
+            # Private Itemless AI follows the game's own Time Trial ghosts (scripts/tt_reference.py,
+            # src/runtime_race_options.c); without them it keeps the native route guidance.
+            env.pop('BB_TT_REFERENCE', None)
+            if title_id in ('CUSA13795', 'CUSA14876') and app_version == '01.21':
+                tt = run_python('scripts/tt_reference.py', game, '--out', out / 'tt-reference',
+                                capture=True, check=False)
+                if tt.returncode == 0 and (out / 'tt-reference/reference.bin').is_file():
+                    env['BB_TT_REFERENCE'] = str((out / 'tt-reference/reference.bin').resolve())
+                else:
+                    say('Time Trial references not prepared: the AI keeps its native route guidance')
             if env.get('BB_ONLINE') == '1' or env.get('BB_SPEED_SOLO_TEST') == '1':
                 if title_id in ('CUSA13795', 'CUSA14876') and app_version == '01.21':
                     base = [Path(p) for p in archives.split('|') if p]
                     if env.get('BB_ONLINE') == '1':
-                        base, env['BB_ONLINE_MODE_HOOK'] = online_mode.prepare(
-                            game, out / 'online-mode', out / 'eboot.elf', base)
+                        base, env['BB_ONLINE_MODE_HOOK'] = startup_call('online_mode.prepare', online_mode.prepare,
+                            game, out / 'online-mode', boot / 'eboot.elf', base)
                         env['BB_MOD_FILE_MAP'] = str((out / 'online-mode/cup-files.map').resolve())
                         env.setdefault('BB_MOD_SOURCE_GAME', str(game))
-                        env['BB_KNOWN_HEROES'] = online_mode.known_heroes(game)
+                        env['BB_KNOWN_HEROES'] = startup_call('online_mode.known_heroes', online_mode.known_heroes, game)
                     try:
-                        normal_patches, speed_patches, track_count = speed_mode.prepare(
+                        normal_patches, speed_patches, track_count = startup_call('speed_mode.prepare', speed_mode.prepare,
                             game, out / 'speed-mode', base)
                     except (ValueError, OSError, KeyError, IndexError) as error:
                         # a damaged game file stops Speed Mode only: online plays as before
-                        say(f'ITEMLESS (Experimental) not available: {error}')
+                        say(f'ITEMLESS not available: {error}')
                         archives = '|'.join(map(str, base))
                     else:
                         archives = '|'.join(map(str, normal_patches))
                         env['BB_PRIVATE_ARCHIVE_PATCHES'] = '|'.join(map(str, speed_patches))
-                        say(f'ITEMLESS (Experimental): {track_count} tracks prepared for private rooms')
+                        say(f'ITEMLESS: {track_count} tracks prepared for private rooms')
             if archives:
                 env['BB_ARCHIVE_PATCHES'] = archives
             else:
@@ -917,7 +984,7 @@ def main():
 
         settings, layout_patches = apply_layout()
         if mod_packages.ACTIVE:
-            mod_packages.preflight(Path(env['BB_PATCHES_DIR']).parent, settings, Path(env['BB_PATCHES_CONFIG']),
+            startup_call('mod_packages.preflight', mod_packages.preflight, Path(env['BB_PATCHES_DIR']).parent, settings, Path(env['BB_PATCHES_CONFIG']),
                                    [layout_patches] if layout_patches else [], title_id, app_version, game=game)
         apply_render_res(env, settings)
         say(f'PS4 Pro mode: {env["BB_NEO"]} (BB_NEO=1 turns it on)')
@@ -942,6 +1009,8 @@ def main():
                 break
         say(f'SacredFire {version or "unknown version"}')
         update_notice(env, version)
+        env['BB_OCTR_VERSION'] = version.removeprefix('v').split('-')[0] if version else ''  # the game's login says it
+        env['BB_MACHINE_ID'] = machine_header()  # this PC's anonymous fingerprint, for bans
         # The graphics engine (bbport.ini renderer): the native Vulkan renderer is experimental; its
         # shaders are built from this game the first time (scripts/native_shaders.py, ~5 minutes).
         # Anything that stops it starts the game with shadPS4's Vulkan, as before.
@@ -974,7 +1043,7 @@ def main():
         # here, with the patches chosen in the menu, in the same console and log.
         env['BB_RESTART_EXIT_CODE'] = str(RESTART_CODE)
         env.pop('BB_RESTART_COMMAND', None)
-        command = [str(probe), str(out / 'boot-linked.bin'), '--import-names', str(out / 'import_names.txt'),
+        command = [str(probe), str(boot / 'boot-linked.bin'), '--import-names', str(out / 'import_names.txt'),
                    '--content-profile', str(out / 'content.bin'), '--patches', str(out / 'patches.bin'),
                    '--app0', str(game), '--user', str(user_dir),
                    '--timeout', env.get('BB_TIMEOUT', '0'), *isa_args, *args]
@@ -986,14 +1055,14 @@ def main():
                 settings, layout_patches = apply_layout()
                 apply_render_res(env, settings)
                 if mod_packages.ACTIVE:
-                    mod_packages.preflight(Path(env['BB_PATCHES_DIR']).parent, settings, Path(env['BB_PATCHES_CONFIG']),
+                    startup_call('mod_packages.preflight', mod_packages.preflight, Path(env['BB_PATCHES_DIR']).parent, settings, Path(env['BB_PATCHES_CONFIG']),
                                            [layout_patches] if layout_patches else [], title_id, app_version, game=game)
             first = False
             run_python('scripts/patches.py', '--patches-dir', env.get('BB_PATCHES_DIR', 'patches'),
                        *(['--strict-overlap'] if mod_packages.ACTIVE else []),
                        *(['--patches-dir', layout_patches] if layout_patches else []),
                        '--patches-config', env.get('BB_PATCHES_CONFIG', data / 'patches.json'),
-                       '--app-version', app_version, '--title-id', title_id, '--out', out,
+                       '--app-version', app_version, '--title-id', title_id, '--out', out, '--boot-dir', boot,
                        '--settings', settings)
             # Ultrawide: videos and cutscenes at 16:9 (src/runtime_cinematic.c) unless turned off.
             for key in ('BB_CINEMATIC_16X9', 'BB_CUTSCENE'):
@@ -1001,22 +1070,34 @@ def main():
             plan = render_plan_of(settings)
             if plan and plan.get('output') and not ini_has(settings, 'ultrawide_cinematics=0'):
                 env['BB_CINEMATIC_16X9'] = '1'
-                env['BB_CUTSCENE'] = run_python('scripts/patches.py', '--print-cutscene', '--out', out,
+                env['BB_CUTSCENE'] = run_python('scripts/patches.py', '--print-cutscene', '--out', out, '--boot-dir', boot,
                                                 capture=True).stdout.strip()
             # Ultrawide: the title and customization screens fill the width (src/runtime_frontend.c).
             env.pop('BB_FRONTEND_FOV', None)
             if plan and plan.get('output') and not ini_has(settings, 'ultrawide_frontend=0'):
-                env['BB_FRONTEND_FOV'] = run_python('scripts/patches.py', '--print-frontend', '--out', out,
+                env['BB_FRONTEND_FOV'] = run_python('scripts/patches.py', '--print-frontend', '--out', out, '--boot-dir', boot,
                                                     capture=True).stdout.strip()
             # Disable Motion Blur: the eboot patch stops the camera's blur; the blur shaders go too
             # (objects moving on their own: the crowd, plants; bb_motion_blur.h)
             env['BB_NO_MOTION_BLUR'] = '1' if ini_has(config, 'patch_no_motion_blur=1') else '0'
+            # Started from Steam (a non-Steam shortcut), Steam turns on its Fossilize layer, which
+            # records every pipeline the game builds: thousands at start, so the window stayed
+            # black for minutes. Steam never ships a shader cache for a shortcut, so it only costs.
+            # The overlay layer (Shift+Tab) stays.
+            env['DISABLE_VK_LAYER_VALVE_steam_fossilize_1'] = '1'
+            applied = patches.applied_game_patches(out)  # None: an older compile, trusted
             if user_vblank:
                 env['BB_VBLANK_HZ'] = user_vblank
-            elif ini_has(config, 'patch_60fps=1'):
+            elif ini_has(config, 'patch_60fps=1') and (applied is None or 'patch_60fps' in applied):
                 # The game's own limiter paces frames; a 60 Hz vblank would quantize late frames.
                 env['BB_VBLANK_HZ'] = '480'
                 say('60 FPS patch on: virtual vblank 480 Hz')
+            elif ini_has(config, 'patch_60fps=1'):
+                # The patch was skipped (its code is not in this build of the update): the game
+                # still waits for vblanks at 30 FPS, and a 480 Hz vblank would run it 8 times fast.
+                env['BB_VBLANK_HZ'] = {'uncap': '480', '90': '90'}.get(fps, '60')
+                say('60 FPS patch: not applied (see "Patches: skipped" above); the game runs at '
+                    'its own 30 FPS with a 60 Hz vblank')
             else:
                 env['BB_VBLANK_HZ'] = {'uncap': '480', '90': '90'}.get(fps, '60')
             # No stdin: an inherited pipe (Git Bash, MSYS2) cost the game its console output.

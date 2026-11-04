@@ -6,7 +6,7 @@ import json, struct
 import archive_patch
 import mod_strings
 from archive_reader import Archive
-from mod_components import payload_bytes, under, sha_bytes, plain_path
+from mod_components import payload_bytes, under, sha_bytes, plain_path, long_path
 
 
 def file_map(game, target, directories, replacements):
@@ -24,9 +24,9 @@ def file_map(game, target, directories, replacements):
             raise ValueError('Conflicting file redirections: '+relative)
         seen.append(key)
         # The engine opens these with the usual Windows paths, not the library's long_path form.
-        source=plain_path(Path(source).resolve(strict=True))
+        source=plain_path(long_path(source).resolve(strict=True))
         if source.is_relative_to(plain_path(Path(game).resolve())):raise ValueError('Replacement must come from mod storage')
-        if not source.is_file():raise ValueError('Mod replacement is not a file: '+relative)
+        if not long_path(source).is_file():raise ValueError('Mod replacement is not a file: '+relative)
         a=relative.encode('utf-8');b=str(source).encode('utf-8')
         if not 0<len(a)<1024 or not 0<len(b)<4096 or b'\0' in a+b:
             raise ValueError('Mod file path exceeds engine limits')
@@ -36,10 +36,23 @@ def file_map(game, target, directories, replacements):
     Path(target).write_bytes(b'BBFILE01'+struct.pack('<I',len(records))+b''.join(records))
 
 
+
+
+def replaced_by_base(archive, base, indices):
+    """Of these entry indices, those the built-in patch base already replaces (its 16-byte
+    record ranges, scripts/archive_patch.py)."""
+    if base is None:
+        return set()
+    count = len(archive.files)
+    taken = {o for o, d in archive_patch.read(base)[2] if len(d) == 16}
+    return {i for i in indices if 0x38 + 4 * count + 16 * i in taken}
+
+
 def compose(game, out, records, base_patches):
     """Append validated mod entries to built-in patches, one patch per guest archive.
 
-    A collision with a built-in entry is an error, never a silently dropped layer.
+    A collision with a built-in entry is an error, never a silently dropped layer. (A mod's
+    systemData.igz gets the server's item-box rules over it afterwards: scripts/item_rules.py.)
     Runtime bounds are checked here because its parser would otherwise ignore them.
     """
     made = dict(base_patches)
@@ -75,13 +88,20 @@ def compose(game, out, records, base_patches):
                 if index in entries:
                     raise ValueError('Duplicate mod archive entry: ' + archive.files[index]['path'])
                 entries[index] = mod_strings.apply(archive.extract(archive.files[index]), changes)
+            guest = '/app0/archives/' + name
+            for index in sorted(replaced_by_base(archive, made.get(guest), entries)):
+                raise ValueError('A mod replaces ' + archive.files[index]['path'] + ', which an OCTR '
+                                 'setting also changes; turn that setting or the mod off')
         finally:
             archive.data.close(); archive._file.close()
-        guest = '/app0/archives/' + name
+        if not entries:
+            continue
         target = out / (sha_bytes(guest.encode()) + '.bbpatch')
         archive_patch.write_entries_patch(target, path, guest, entries, made.get(guest))
         _, _, ranges = archive_patch.read(target)
-        if len(ranges) > 4096 or target.stat().st_size >= 64 * 1024**2:
+        # src/runtime_file.c: MAX_PATCH_RANGES (2 per replaced entry); the size has no limit, as
+        # the engine reads large entries from the file when the game needs them.
+        if len(ranges) > 65536:
             raise ValueError('Mod archive overlay exceeds engine limits: ' + name)
         made[guest] = target
     if len(made) > 32:

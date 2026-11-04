@@ -47,7 +47,7 @@ class OverlayTests(unittest.TestCase):
             record=archive_patch.view(source,result,60,16);offset,extra,length,mode=struct.unpack('<4I',record)
             self.assertEqual(archive_patch.view(source,result,offset|((extra&255)<<32),length),b'CUSTOM')
             self.assertEqual(source.stat().st_size,before);self.assertEqual(source.read_bytes()[:4096],header)
-            with self.assertRaisesRegex(ValueError,'already replaced'):
+            with self.assertRaisesRegex(ValueError,'OCTR setting also changes'):
                 compose(game,root/'conflict',[(op,folder)],made)
     def test_file_map_redirects_host_reads_without_game_tree(self):
         with tempfile.TemporaryDirectory() as tmp:

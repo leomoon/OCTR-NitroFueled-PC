@@ -39,8 +39,14 @@ start prepares the game's shaders for your GPU from your own dump (a few seconds
 [shaders/README.md](shaders/README.md)), so new tracks and racers no longer stop the game to
 compile them; the few the recipe lacks are compiled when first seen and cached.
 
+Time Trial on recognized USA/EU 1.21 executables credits every challenge beaten by a finish:
+N. Tropy, Oxide, Velo and developer times, even with no ghost selected. Times must be strictly
+faster; existing progress is kept. Rewards still require completing their required tracks.
+Other executable layouts keep the game's original progression.
+
 | Release | What it brought |
 |---|---|
+| [v0.8](https://github.com/Ryu7w7/OCTR-NitroFueled-PC/releases/tag/v0.8) | Public Itemless matchmaking with its own queue and private team races (n0buholic); much faster starts (boot cache, n0buholic; Itemless kept between starts) and no black screen from Steam shortcuts; one save with or without mods; online item odds the client cannot change; bans that follow the player's PC; GPU picker by name for laptops; time trials credit every beaten ghost at once (n0buholic); borderless window covers the screen and faster native Vulkan compiles on NVIDIA (Enrique-Ale); Bahasa Indonesia in the launcher |
 | [v0.7.5](https://github.com/Ryu7w7/OCTR-NitroFueled-PC/releases/tag/v0.7.5) | Another player's racer from a mod you don't have shows as Crash instead of freezing the lobby at 0; Itemless no longer carries over to public races (no items, Tiger Temple's door open); Discord invites with mods on (Vo1dTear); a clear message when an antivirus blocks the game |
 | [v0.7.4](https://github.com/Ryu7w7/OCTR-NitroFueled-PC/releases/tag/v0.7.4) | Private online cups: four tracks with the game's points and a podium from the totals (n0buholic); a native Graphics page and no crash opening Options in a race (n0buholic); Speed Mode renamed Itemless, where bumping another kart keeps your reserves (n0buholic); experimental 16:10 (david-labib); AMD FSR 4 (experimental, shown only with its model files; GetLostIn's wiring); crash signatures in the anonymous performance data |
 | [v0.7.3](https://github.com/Ryu7w7/OCTR-NitroFueled-PC/releases/tag/v0.7.3) | Native Vulkan: faster (translated shaders about half as heavy, no hitches from descriptor sets, a lighter capture thread in the adventure hub), Hyper Spaceway's dark sheet of triangles and Assembly Lane's whitish steam fixed; a damaged game file no longer stops online at start (Speed Mode is skipped); Graphics and Quit Game in Arabic (Majed-allababedi) |
@@ -99,6 +105,12 @@ game). From the game's own menus you can:
 Shared default names (RyuPC, Player, Jugador...) are refused. The first installation that plays
 with a nickname keeps it, through the key in `ryunet_online.key` (copied to
 `%APPDATA%\CTR-NitroFueled-PC`): **never share that file.**
+
+**Fair play.** Players banned for cheating are banned with their PC, not only their nickname: a
+new nickname or a fresh install does not bring them back. For this the game sends the server an
+anonymous fingerprint of the PC: two SHA-256 digests of Windows' installation ID and the
+motherboard's ID (`scripts/machine_id.py`). The server can only tell whether it saw the same PC
+again; it never learns the hardware, and the IDs themselves never leave the PC.
 
 **Discord** (Windows launcher, Online tab):
 
@@ -299,8 +311,9 @@ game folder into your icon theme; the game window shows it too.
 archive blocks, keeping the original compressed game files and requiring no disk cache. The
 patch checks the decoder and its one-shot caller before installing; unsupported layouts and
 blocks retain the original decoder. Set `BB_NATIVE_LZMA=0` in the launcher's extra environment
-to compare or disable it. On hosts with at least 12 logical CPUs, the verified streaming queue
-uses six existing background workers instead of four. Source builds require liblzma 5.4 or newer (`xz` in `shell.nix`).
+to compare or disable it. The streaming queue keeps the game's four workers to limit concurrent
+memory use. `BB_LZMA_WORKERS=6` experimentally enables six on hosts with at least eight logical
+CPUs. Source builds require liblzma 5.4 or newer (`xz` in `shell.nix`).
 
 **In-game menu** (Insert, or L3+R3 on the pad): game patches, controller ports for split
 screen, FPS limit, fullscreen, FPS counter, menu language. It is saved to `bbport.ini`; patches apply after a restart.
@@ -458,9 +471,11 @@ names from shadPS4's aerolib list.
 
 ### Aspect ratio
 
-Display settings offer 16:9 (default), experimental 16:10, 21:9 and 32:9. The in-game
+Display settings offer 16:9 (default), 16:10, 21:9 and 32:9. The in-game
 Graphics page offers the same choices after a restart. 16:10 supports 1280x800, 1920x1200
-and 2560x1600 through its own display/camera preparation, with the original menus and HUD.
+and 2560x1600 through its own display/camera preparation, with aligned HUD effects
+(including Adventure collectibles and the filling drift gauge) and corrected gauge
+proportions. The original menu layout is retained.
 See [aspect ratio settings and 16:10 verification](docs/sacredfire/23-aspect-ratios.md).
 
 ### Corrected widescreen layouts (Windows)
