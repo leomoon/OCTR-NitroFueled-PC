@@ -1042,6 +1042,8 @@ static void sample(PadData *d) {
 static pthread_mutex_t read_lock=PTHREAD_MUTEX_INITIALIZER; /* the game side of sampling (sample) */
 static ABI int32_t pad_init(void) {
     pthread_mutex_lock(&lock);
+    /* Also cover pad initialization before the SDL window exists. */
+    SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS,"1");
     initialized=1;
     if (!pad_thread_state) {
         pthread_t thread;
@@ -1065,11 +1067,12 @@ static ABI int32_t pad_open(int32_t user, int32_t type, int32_t index, const voi
     pthread_mutex_lock(&lock);
     int already, assigned=1;
     if (user==1) { already=opened; opened=1; }
-    else { assigned=ports[user-1].want[0]!=0; already=ports[user-1].opened; if (assigned) ports[user-1].opened=1; }
+    else { assigned=ports[user-1].want[0]!=0 || ports[user-1].pad!=NULL; already=ports[user-1].opened; if (assigned) ports[user-1].opened=1; }
     pthread_mutex_unlock(&lock);
     if (!assigned) return ERR_INVALID_ARG;
     if (already) return ERR_ALREADY_OPENED;
-    printf("Runtime: pad opened for user %d (%s)\n",user,user==1 ? "SDL gamepad or keyboard" : ports[user-1].want);
+    printf("Runtime: pad opened for user %d (%s)\n",user,user==1 ? "SDL gamepad or keyboard" :
+           ports[user-1].want[0] ? ports[user-1].want : "automatically assigned controller");
     return user;
 }
 static ABI int32_t pad_close(int32_t handle) {

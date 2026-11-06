@@ -96,6 +96,7 @@ void runtime_cinematic_cutscene_fill(void); /* cutscenes get a 16:9 field of vie
 /* SacredFire: ultrawide title and customization screens (runtime_frontend.c). */
 void runtime_frontend_start(const unsigned char *image);
 int runtime_online_mode_start(unsigned char *image, size_t size);
+int runtime_friends_native_start(unsigned char *image, size_t size);
 int runtime_time_trial_start(unsigned char *image, size_t size);
 /* The private room's mode through RyuNET (runtime_room_mode.c): the host publishes its choice,
  * a player who joins takes it, also when joining by invitation (no selector seen). */
@@ -120,8 +121,13 @@ int runtime_public_itemless_start(unsigned char *image, size_t size);
 int runtime_public_itemless_available(void);
 int runtime_public_itemless_announce(void);
 int runtime_public_itemless_active(void);
+int runtime_public_match_active(void);
 int runtime_private_match_active(void);
+/* 1 accepted, 0 rejected, -1 asynchronous check pending. */
 int runtime_private_party_check(void);
+void runtime_private_party_defer_start(void *self, void (ABI *resume)(void *));
+int runtime_private_party_update(void);
+void runtime_private_party_cancel(void);
 int runtime_private_difficulty_modified(void);
 int runtime_public_itemless_selected(void);
 void runtime_public_itemless_select(int enabled);
@@ -135,6 +141,9 @@ void runtime_race_options_map_loading(const char *map);
 int runtime_race_options_start(unsigned char *image, size_t size);
 void runtime_race_options_stop_boost(void *boost, void (ABI *stop)(void *));
 int runtime_itemless_start(unsigned char *image, size_t size);
+int runtime_replay_start(unsigned char *image, size_t size); /* runtime_replay.c (spectator build) */
+/* 1 while a replay of a race without item crates (Time Trial, Itemless) loads or plays (runtime_replay_play.c) */
+int runtime_replay_no_crates(void);
 /* SacredFire online: the running game's title id for the PSN data (runtime_services.c). */
 void runtime_np_set_title(const char *title_id);
 void runtime_file_report(void);
@@ -172,6 +181,7 @@ uintptr_t runtime_rtc_resolve(const char *name);
 const char *runtime_file_user_dir(void);
 const char *runtime_file_progress_dir(void); /* saves and trophies: BB_PROGRESS_DIR or the user folder */
 void runtime_savedata_configure(const char *title);
+const char *runtime_savedata_title(void);
 /* The game's TITLE_ID: where its trophies are kept (<user>/trophies/<title>/). */
 void runtime_trophy_configure(const char *title);
 void runtime_meta_dump_start(unsigned char *image, size_t size); /* BB_META_DUMP=1: field metadata (lab) */

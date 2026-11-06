@@ -2,6 +2,7 @@
 #include "../src/runtime_file.c"
 #include <assert.h>
 void runtime_cinematic_video(int delta) { (void)delta; }
+int runtime_replay_no_crates(void) { return 0; }
 static int private_room, private_match, public_room;
 int runtime_public_itemless_active(void) { return public_room; }
 int runtime_private_room_active(void) { return private_room; }
@@ -66,6 +67,25 @@ int main(int argc,char **argv) {
         content("/app0/archives/race.pak", "ITEMLESS");
         private_room=1;runtime_speed_mode_set(0);
         content("/app0/archives/race.pak", "NORMAL__");
+        /* An archive already open in Itemless must return Normal HUD bytes after switching. */
+        runtime_speed_mode_set(1);
+        int fd=(int)do_open("/app0/archives/race.pak",0,0);assert(fd>=3);
+        const int transitions[]={1,0,1,0};
+        for (size_t i=0;i<sizeof transitions/sizeof *transitions;++i) {
+            runtime_speed_mode_set(transitions[i]);
+            char bytes[8];
+            assert(do_pread(fd,bytes,sizeof bytes,0)==sizeof bytes);
+            assert(!memcmp(bytes,transitions[i] ? "ITEMLESS" : "NORMAL__",sizeof bytes));
+        }
+        /* Leaving public Itemless must restore Normal even with a stale private choice. */
+        runtime_speed_mode_set(1);private_match=0;
+        for (size_t i=0;i<sizeof transitions/sizeof *transitions;++i) {
+            public_room=transitions[i];
+            char bytes[8];
+            assert(do_pread(fd,bytes,sizeof bytes,0)==sizeof bytes);
+            assert(!memcmp(bytes,public_room ? "ITEMLESS" : "NORMAL__",sizeof bytes));
+        }
+        assert(!do_close(fd));
         return 0;
     }
     if (!strncmp(argv[3],"menus-",6)) {

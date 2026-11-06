@@ -23,6 +23,8 @@
 #include "bbport_perf.h"
 #include "bbport_settings.h"
 #include "../../src/runtime_friends.h"
+#include "../../src/runtime_spectate.h"
+#include "../../src/runtime_replay_list.h"
 #include "../../src/runtime_net_ping.h"
 #include "imgui.h"
 #include "imgui_internal.h" // RegisterUserTexture: the trophy pictures
@@ -424,6 +426,7 @@ void PollFriends() {
     if (!privacy_sent) { // the server learns "appear offline" once per game
         privacy_sent = true;
         runtime_friends_set_hidden(s.friends_hide_me);
+        runtime_spectate_set_share(s.spectate_share);
     }
     // The server administrators' messages: always shown, whatever the
     // friends options say.
@@ -636,6 +639,113 @@ void ReportTab() {
     ReportSection(view, g_report_who);
 }
 
+// Spectator build: the races in RaceReplay (src/runtime_replay.c records them), newest first.
+void ReplaysTab() {
+    static RrListEntry list[RR_LIST_MAX];
+    static int listed = -1;
+    static double listed_at = -100.0;
+    const double now = ImGui::GetTime();
+    if (listed < 0 || now - listed_at > 3.0) {
+        listed = runtime_replay_list(list, RR_LIST_MAX);
+        listed_at = now;
+    }
+    ImGui::TextWrapped("%s", BbSettings::MenuText(
+                                 "Every race is recorded. Watch one from the main menu: L1 / R1 lap, L2 / R2 racer, "
+                                 "Square pause, Up / Down speed, Left / Right rewind and fast forward; leave with the pause "
+                                 "menu's Quit.",
+                                 "Каждая гонка записывается."));
+    const bool can_start = runtime_replay_can_start() != 0;
+    if (runtime_replay_playing()) {
+        ImGui::TextColored(kFriendGreen, "%s", BbSettings::MenuText("A replay is on.", "Идёт повтор."));
+    } else if (!can_start) {
+        ImGui::TextColored(kMenuYellow, "%s", BbSettings::MenuText("Replays start from the menus, not during a race.",
+                                                                   "Повторы запускаются из меню, не во время гонки."));
+    }
+    // managing them: the shared "replays" folder next to bbport.ini (export copies a race there, import takes the
+    // races put there), and deleting one (asked twice)
+    static std::string status;
+    static double status_at = -100.0;
+    static char confirm_delete[64] = "";
+    const auto say = [&](const std::string& text) {
+        status = text;
+        status_at = now;
+    };
+    if (ImGui::Button(BbSettings::MenuText("Import", "Импорт"))) {
+        const int copied = runtime_replay_import();
+        char text[160];
+        if (copied < 0) {
+            std::snprintf(text, sizeof text, "%s",
+                          BbSettings::MenuText("No races in the replays folder: put .crr files there first.",
+                                               "В папке replays нет гонок."));
+        } else {
+            std::snprintf(text, sizeof text, BbSettings::MenuText("%d new race(s) imported.", "Импортировано: %d."), copied);
+        }
+        say(text);
+        listed = -1;
+    }
+    ImGui::SameLine();
+    if (ImGui::Button(BbSettings::MenuText("Open folder", "Открыть папку"))) {
+        char folder[700];
+        runtime_replay_folder(folder, sizeof folder);
+        std::string url = "file:///";
+        for (const char* c = folder; *c; ++c) url += *c == '\\' ? '/' : *c;
+        SDL_OpenURL(url.c_str());
+    }
+    ImGui::SameLine();
+    ImGui::TextDisabled("%s", BbSettings::MenuText("(the replays folder next to the game)", "(папка replays рядом с игрой)"));
+    if (!status.empty() && now - status_at < 6.0) ImGui::TextColored(kFriendGreen, "%s", status.c_str());
+    if (!listed) {
+        ImGui::TextDisabled("%s", BbSettings::MenuText("No races recorded yet.", "Записанных гонок пока нет."));
+        return;
+    }
+    if (ImGui::BeginTable("##replays", 7, ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingFixedFit)) {
+        for (int i = 0; i < listed; ++i) {
+            const RrListEntry& e = list[i];
+            ImGui::PushID(i);
+            ImGui::TableNextRow();
+            ImGui::TableNextColumn();
+            ImGui::BeginDisabled(!can_start);
+            if (ImGui::SmallButton(BbSettings::MenuText("Watch", "Смотреть")) && runtime_replay_play_file(e.file)) {
+                SetOpen(false);
+            }
+            ImGui::EndDisabled();
+            ImGui::TableNextColumn();
+            ImGui::TextUnformatted(e.track);
+            ImGui::TableNextColumn();
+            ImGui::TextUnformatted(e.player);
+            ImGui::TableNextColumn();
+            if (e.place) ImGui::Text("#%d", e.place);
+            else ImGui::TextDisabled("-");
+            ImGui::TableNextColumn();
+            ImGui::TextDisabled("%s  %d:%02d", e.when, (int)e.duration / 60, (int)e.duration % 60);
+            ImGui::TableNextColumn();
+            if (ImGui::SmallButton(BbSettings::MenuText("Export", "Экспорт"))) {
+                char saved[200] = "", text[300];
+                if (runtime_replay_export(e.file, saved, sizeof saved)) {
+                    std::snprintf(text, sizeof text, BbSettings::MenuText("Exported to the replays folder: %s",
+                                                                          "Сохранено в папку replays: %s"), saved);
+                } else {
+                    std::snprintf(text, sizeof text, "%s", BbSettings::MenuText("Could not export it.", "Не удалось экспортировать."));
+                }
+                say(text);
+            }
+            ImGui::TableNextColumn();
+            if (!std::strcmp(confirm_delete, e.file)) {
+                if (ImGui::SmallButton(BbSettings::MenuText("Sure? Delete", "Точно удалить?"))) {
+                    say(runtime_replay_delete(e.file) ? BbSettings::MenuText("Deleted.", "Удалено.")
+                                                      : BbSettings::MenuText("Could not delete it.", "Не удалось удалить."));
+                    confirm_delete[0] = 0;
+                    listed = -1;
+                }
+            } else if (ImGui::SmallButton(BbSettings::MenuText("Delete", "Удалить"))) {
+                std::snprintf(confirm_delete, sizeof confirm_delete, "%s", e.file);
+            }
+            ImGui::PopID();
+        }
+        ImGui::EndTable();
+    }
+}
+
 void FriendsTab() {
     static RfView view;
     static unsigned seen = ~0u;
@@ -785,6 +895,15 @@ void FriendsTab() {
         if (f.online) {
             ImGui::SameLine();
             if (ImGui::Button(BbSettings::MenuText("Invite", "Пригласить"))) act("invite", f.name);
+            ImGui::SameLine();
+            // Spectator build: the friend's live race (else their newest shared race), then each next race of
+            // theirs by itself until Stop spectating.
+            char followed[32] = "";
+            if (runtime_spectate_following(followed, sizeof followed) && !std::strcmp(followed, f.name)) {
+                if (ImGui::Button(BbSettings::MenuText("Stop spectating", "Не смотреть"))) runtime_spectate_stop();
+            } else if (ImGui::Button(BbSettings::MenuText("Spectate (beta)", "Смотреть (бета)"))) {
+                runtime_spectate_watch(f.name);
+            }
         }
         ImGui::SameLine();
         if (confirm_remove == f.name) {
@@ -797,6 +916,34 @@ void FriendsTab() {
         }
         ImGui::PopID();
     };
+    {   // Spectator build: the last Spectate request
+        int spectate = RS_IDLE;
+        char who[32] = "";
+        runtime_spectate_status(&spectate, who, sizeof who);
+        const char* line = nullptr;
+        switch (spectate) {
+        case RS_FETCHING: line = BbSettings::MenuText("Looking for %s's live race...", "Ищем гонку %s в эфире..."); break;
+        case RS_READY: line = BbSettings::MenuText("%s's last race is ready: main menu > REPLAYS (top of the list).",
+                                                   "Последняя гонка %s готова: главное меню > REPLAYS (вверху)."); break;
+        case RS_NONE: line = BbSettings::MenuText("%s has no recent race to watch.", "У %s нет недавних гонок."); break;
+        case RS_REFUSED: line = BbSettings::MenuText("%s does not share races with you.", "%s не делится гонками с вами."); break;
+        case RS_FAILED: line = BbSettings::MenuText("Could not download %s's race.", "Не удалось загрузить гонку %s."); break;
+        case RS_LIVE: line = BbSettings::MenuText("Watching %s live.", "Смотрите %s в прямом эфире."); break;
+        case RS_WAITING: line = BbSettings::MenuText("%s is live: waiting for the race to start...", "%s в эфире: ждём старта..."); break;
+        case RS_BUSY: line = BbSettings::MenuText("%s's race loads once you leave the race or the online mode.",
+                                                  "Гонка %s загрузится, когда вы выйдете из гонки или онлайн-режима."); break;
+        case RS_PLAYING: line = BbSettings::MenuText("Playing %s's last race.", "Идёт последняя гонка %s."); break;
+        case RS_FOLLOW: line = BbSettings::MenuText("Spectating %s: their next race loads by itself.",
+                                                    "Смотрите %s: следующая гонка загрузится сама."); break;
+        default: break;
+        }
+        if (line) {
+            char text[200];
+            std::snprintf(text, sizeof text, line, who);
+            ImGui::TextColored(spectate == RS_READY || spectate == RS_LIVE || spectate == RS_PLAYING || spectate == RS_FOLLOW
+                                   ? kFriendGreen : kMenuGrey, "%s", text);
+        }
+    }
     // online friends first and open; offline ones folded (a long list hid everything below it)
     int online = 0;
     for (int i = 0; i < view.friend_count; ++i) {
@@ -837,6 +984,15 @@ void FriendsTab() {
         }
         Hint(BbSettings::MenuText("Your friends see you offline and get no notice when you come online.",
                                   "Друзья видят вас не в сети и не получают уведомлений."));
+        bool share_races = s.spectate_share;
+        if (ImGui::Checkbox(BbSettings::MenuText("Let my friends watch my races", "Друзья могут смотреть мои гонки"),
+                            &share_races)) {
+            Store(s.spectate_share, share_races, true);
+            runtime_spectate_set_share(share_races);
+        }
+        Hint(BbSettings::MenuText("While you race, your race is sent live to the server so your friends can watch it "
+                                  "with Spectate.",
+                                  "Пока вы едете, гонка идёт на сервер в прямом эфире, и друзья могут её смотреть."));
         Checkbox(BbSettings::MenuText("Don't show notifications", "Не показывать уведомления"), s.friends_no_notices);
         Hint(BbSettings::MenuText("No friend notices (requests, invitations, friends online). This tab still shows "
                                   "them.",
@@ -1229,6 +1385,10 @@ void Menu() {
     }
     if (ImGui::BeginTabItem(BbSettings::MenuText("Room", "Комната"))) {
         RoomTab();
+        ImGui::EndTabItem();
+    }
+    if (ImGui::BeginTabItem(BbSettings::MenuText("Replays", "Повторы"))) {
+        ReplaysTab();
         ImGui::EndTabItem();
     }
     {
@@ -1652,6 +1812,102 @@ void PingCounter() {
     PingLines();
     corner_ping_height = ImGui::GetWindowHeight() + 6.0f * base_scale;
     ImGui::End();
+}
+
+/// SPECTATOR (n): friends watching this player's race live, in the top right corner under the FPS
+/// counter and the ping; nothing when nobody watches.
+void SpectatorBadge(int viewers) {
+    const ImGuiViewport* viewport = ImGui::GetMainViewport();
+    const float pad = 12.0f * base_scale;
+    const float below = (BbSettings::Get().show_fps ? corner_fps_height + 6.0f * base_scale : 0.0f) +
+                        corner_ping_height;
+    ImGui::SetNextWindowPos(
+        ImVec2(viewport->WorkPos.x + viewport->WorkSize.x - pad, viewport->WorkPos.y + pad + below),
+        ImGuiCond_Always, ImVec2(1.0f, 0.0f));
+    ImGui::SetNextWindowBgAlpha(0.5f);
+    ImGui::Begin("##spectators", nullptr,
+                 ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize |
+                     ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoNav |
+                     ImGuiWindowFlags_NoFocusOnAppearing);
+    // a red "live" dot before the text
+    const float dot = ImGui::GetTextLineHeight() * 0.3f;
+    const ImVec2 at = ImGui::GetCursorScreenPos();
+    ImGui::GetWindowDrawList()->AddCircleFilled(
+        ImVec2(at.x + dot, at.y + ImGui::GetTextLineHeight() * 0.5f), dot, IM_COL32(230, 40, 40, 255));
+    ImGui::Dummy(ImVec2(dot * 2.0f, ImGui::GetTextLineHeight()));
+    ImGui::SameLine();
+    ImGui::Text("SPECTATOR (%d)", viewers);
+    ImGui::End();
+}
+
+/// Replay results (spectator build): when the recording player finished, as a race's own results screen does,
+/// each racer's place, name and finish time on the right; the others fill in as they finish. The watched racer's
+/// row is highlighted. Nothing is taken from the pad: the replay's controls go on underneath.
+bool ReplayResultsShowing() {
+    RrView v;
+    return runtime_replay_view(&v) && v.results;
+}
+
+void ReplayResults(const RrView& v) {
+    const float s = base_scale;
+    const ImGuiViewport* viewport = ImGui::GetMainViewport();
+    // the finished first, by their finish place; then the ones still racing, by their place now
+    int order[8], n = 0;
+    for (int i = 0; i < 8; ++i)
+        if (v.racer[i].kind) order[n++] = i;
+    std::sort(order, order + n, [&](int a, int b) {
+        const auto& ra = v.racer[a];
+        const auto& rb = v.racer[b];
+        if ((ra.finished > 0) != (rb.finished > 0)) return ra.finished > 0;
+        return (ra.finished > 0 ? ra.finished : ra.rank) < (rb.finished > 0 ? rb.finished : rb.rank);
+    });
+    ImGui::SetNextWindowPos(ImVec2(viewport->WorkPos.x + viewport->WorkSize.x - 48.0f * s,
+                                   viewport->WorkPos.y + viewport->WorkSize.y * 0.5f),
+                            ImGuiCond_Always, ImVec2(1.0f, 0.5f));
+    ImGui::SetNextWindowSize(ImVec2(520.0f * s, 0.0f));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 10.0f * s);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(22.0f * s, 18.0f * s));
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.05f, 0.25f, 0.55f, 0.90f));
+    ImGui::Begin("##replay_results", nullptr,
+                 ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoNav |
+                     ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_AlwaysAutoResize);
+    ImGui::SetWindowFontScale(1.6f);
+    ImGui::TextUnformatted(BbSettings::MenuText("RESULTS", "РЕЗУЛЬТАТЫ"));
+    ImGui::SetWindowFontScale(1.25f);
+    ImGui::Spacing();
+    const float time_x = 520.0f * s - 22.0f * s - ImGui::CalcTextSize("00:00:00").x;
+    for (int k = 0; k < n; ++k) {
+        const auto& r = v.racer[order[k]];
+        const bool watched = order[k] == v.watch;
+        const ImVec4 colour = watched ? ImVec4(1.0f, 0.82f, 0.25f, 1.0f) : ImVec4(1.0f, 1.0f, 1.0f, 1.0f);
+        const int place = r.finished > 0 ? r.finished : (r.rank > 0 ? r.rank : k + 1);
+        ImGui::TextColored(colour, "%d", place);
+        ImGui::SameLine(46.0f * s);
+        ImGui::TextColored(colour, "%s", r.name[0] ? r.name : "-");
+        ImGui::SameLine(time_x);
+        if (r.finished > 0 && r.time > 0.0f) {
+            const int cs = static_cast<int>(r.time * 100.0f + 0.001f);   // cut, as the game shows it
+            ImGui::TextColored(colour, "%d:%02d:%02d", cs / 6000, cs / 100 % 60, cs % 100);
+        } else {
+            ImGui::TextColored(ImVec4(0.75f, 0.82f, 0.95f, 1.0f), "--:--:--");
+        }
+    }
+    ImGui::SetWindowFontScale(1.0f);
+    ImGui::Spacing();
+    char followed[32] = "", footer[160];
+    if (runtime_spectate_following(followed, sizeof followed)) {
+        std::snprintf(footer, sizeof footer,
+                      BbSettings::MenuText("Spectating %s: their next race loads by itself.",
+                                           "Смотрите %s: следующая гонка загрузится сама."),
+                      followed);
+    } else {
+        std::snprintf(footer, sizeof footer, "%s",
+                      BbSettings::MenuText("Pause > Quit: back to the menu.", "Пауза > Выход: назад в меню."));
+    }
+    ImGui::TextColored(ImVec4(0.80f, 0.88f, 1.0f, 1.0f), "%s", footer);
+    ImGui::End();
+    ImGui::PopStyleColor();
+    ImGui::PopStyleVar(2);
 }
 
 // RyuNET server announcements ("maintenance in 5 minutes"): the launcher writes
@@ -2140,7 +2396,8 @@ bool Visible() {
         notice = !notices.empty();
     }
     return initialized && (menu_open || prompt_active || ultrawide_prompt || BbSettings::Get().show_fps ||
-                           (BbSettings::Get().show_ping && InOnlineRoom()) || AnnouncementActive() || notice);
+                           (BbSettings::Get().show_ping && InOnlineRoom()) || AnnouncementActive() || notice ||
+                           runtime_spectate_viewers() > 0 || ReplayResultsShowing());
 }
 
 void Notify(const std::string& title, const std::string& name, const std::string& detail, int kind,
@@ -2226,6 +2483,12 @@ void Render(vk::CommandBuffer cmdbuf, vk::ImageView view, vk::Extent2D extent) {
     corner_ping_height = 0.0f;
     if (BbSettings::Get().show_ping && !menu_open && InOnlineRoom()) {
         PingCounter();
+    }
+    if (const int viewers = runtime_spectate_viewers(); viewers > 0 && !menu_open) {
+        SpectatorBadge(viewers);
+    }
+    if (RrView replay; !menu_open && runtime_replay_view(&replay) && replay.results) {
+        ReplayResults(replay);
     }
     if (prompt_active && !menu_open) {
         TextPrompt();
