@@ -33,6 +33,11 @@ PORT = Path(__file__).resolve().parent
 TITLE_ID = 'CUSA13795'
 APP_VERSION = '01.21'
 RESTART_CODE = 75  # the game asks to be started again (in-game "Apply and restart")
+RANGE_TAKEN_CODE = 25  # a program took part of the PS4 address range, a different place each start
+RANGE_TAKEN_TRIES = 8
+START_FAULT_CODE = 3  # a fault the game could not go on from (probe.c)
+START_FAULT_SECONDS = 45  # the title screen comes later than this
+START_FAULT_TRIES = 2
 UNSUPPORTED_GPU_CODE = 24  # no Vulkan 1.3 or no sparse buffers: GPU, driver or loader (gpu/.../vk_platform.h)
 
 sys.path.insert(0, str(PORT / 'scripts'))
@@ -160,6 +165,18 @@ def run_python(script, *args, capture=False, check=True):
     if check and result.returncode:
         sys.exit(result.returncode)
     return result if capture else None
+
+
+def retry_failed_start(code, seconds, tries):
+    """Whether to start the game again because it stopped on a fault while starting. Two such faults
+    (a global object not there yet) are races: the same PCs start the next time."""
+    return code == START_FAULT_CODE and seconds < START_FAULT_SECONDS and tries < START_FAULT_TRIES
+
+
+def retry_taken_range(code, tries):
+    """Whether to start the game again because the PS4 address range was taken: it fails in an
+    instant, before the window opens, and the next start usually finds the range free."""
+    return code == RANGE_TAKEN_CODE and tries < RANGE_TAKEN_TRIES
 
 
 def find_executable(name):
@@ -650,6 +667,17 @@ def setup_online(env, config, data):
         say(f'Item rules from the server: {items.get("name") or "custom"}')
 
 
+def keep_corrupt_free_log():
+    """The game goes on past a corrupt free (probe.c) and the next start writes over this log, the
+    only record of what the block held: a copy stays beside it, the last one."""
+    if LOG and PERF.corrupt_free:
+        LOG.flush()
+        log = Path(LOG.name)
+        kept = log.with_name(f'{log.stem}_corrupt_free.log')
+        shutil.copyfile(log, kept)
+        say(f'A corrupt memory block was caught: the log is kept in {kept.name}')
+
+
 def finish_perf_report(env, config, data, version, title_id, code):
     """The anonymous performance report of this launch: kept beside the logs (perf/), sent to the
     RyuNET server only when the player said yes (bbport.ini perf_reports=1, asked once by the
@@ -657,6 +685,7 @@ def finish_perf_report(env, config, data, version, title_id, code):
     if not PERF:
         return
     try:
+        keep_corrupt_free_log()
         report = PERF.report({
             'octr': version[:40],
             'edition': title_id,
@@ -1048,6 +1077,7 @@ def launch(args, restarted=False):
                    '--app0', str(game), '--user', str(user_dir),
                    '--timeout', env.get('BB_TIMEOUT', '0'), *isa_args, *args]
         first = True
+        range_tries = start_tries = 0
         global PERF
         PERF = perf_report.Collector()
         while True:
@@ -1102,6 +1132,7 @@ def launch(args, restarted=False):
                 env['BB_VBLANK_HZ'] = {'uncap': '480', '90': '90'}.get(fps, '60')
             # No stdin: an inherited pipe (Git Bash, MSYS2) cost the game its console output.
             try:
+                start_time = time.monotonic()
                 process = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                            stderr=subprocess.STDOUT, creationflags=no_console())
             except PermissionError as error:
@@ -1117,9 +1148,25 @@ def launch(args, restarted=False):
                 env['VK_LOADER_LAYERS_DISABLE'] = '~implicit~'
                 say(f'--- SacredFire launch {time.strftime("%Y-%m-%d %H:%M:%S")} (without overlay layers)')
                 continue
+            if retry_taken_range(code, range_tries):
+                range_tries += 1
+                say(f'--- SacredFire launch {time.strftime("%Y-%m-%d %H:%M:%S")} '
+                    f'(the memory the game needs was taken: try {range_tries + 1} of {RANGE_TAKEN_TRIES + 1})')
+                continue
+            if retry_failed_start(code, time.monotonic() - start_time, start_tries):
+                start_tries += 1
+                finish_perf_report(env, config, data, version, title_id, code)  # each failed start is counted
+                PERF = perf_report.Collector()
+                say(f'--- SacredFire launch {time.strftime("%Y-%m-%d %H:%M:%S")} '
+                    f'(the game stopped while starting: try {start_tries + 1} of {START_FAULT_TRIES + 1})')
+                continue
             if code != RESTART_CODE:
                 say(f'--- the game ended with code {code}')
                 finish_perf_report(env, config, data, version, title_id, code)
+                if code == RANGE_TAKEN_CODE:
+                    say('--- Another program keeps taking the memory the game needs (see the "Module from '
+                        'outside" lines above): close overlays and tuning tools, and exclude the game folder '
+                        'from your antivirus.')
                 if code == UNSUPPORTED_GPU_CODE:
                     say('--- This GPU or its driver lacks what the game needs from Vulkan (version 1.3 and '
                         'sparse buffers; the STOP line above says which). Update the graphics driver; if it '
